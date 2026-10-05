@@ -1486,6 +1486,7 @@ error_code cellAdecQueryAttr(ppu_thread& ppu, vm::ptr<CellAdecType> type, vm::pt
 
 static std::mutex rb_adec_ranges_mutex;
 static std::map<u32, std::pair<u32, u32>> rb_adec_ranges;
+static constexpr u32 rb_adec_stream_window = 0x40000; // rollback: range after an instance where non-PPU writes are not rolled back
 
 error_code adecOpen(ppu_thread& ppu, vm::ptr<CellAdecType> type, vm::cptr<CellAdecResource> res, vm::cptr<CellAdecCb> cb, vm::pptr<AdecContext> handle, vm::cptr<CellAdecResourceSpurs> spursRes)
 {
@@ -1577,6 +1578,10 @@ error_code adecOpen(ppu_thread& ppu, vm::ptr<CellAdecType> type, vm::cptr<CellAd
 
 	rb::state_exclude_async(res->startAddr, res->startAddr + res->totalMemSize, "cellAdec instance");
 
+	// Tekken 6 allocates the AT3P stream ring buffer right after the instance (stage music: a ~0x20000 ring at instance end
+	// + ~0x6b75, written by the sound SPU, missed by the write tracking): non-PPU writes there are not rolled back
+	rb::state_foreign_window(res->startAddr + res->totalMemSize, res->startAddr + res->totalMemSize + rb_adec_stream_window, true);
+
 	const auto notifyAuDone = vm::ptr<AdecNotifyAuDone>::make(g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(adecNotifyAuDone)));
 	const auto notifyPcmOut = vm::ptr<AdecNotifyPcmOut>::make(g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(adecNotifyPcmOut)));
 	const auto notifyError = vm::ptr<AdecNotifyError>::make(g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(adecNotifyError)));
@@ -1648,6 +1653,7 @@ error_code cellAdecClose(ppu_thread& ppu, vm::ptr<AdecContext> handle)
 		if (const auto it = rb_adec_ranges.find(handle.addr()); it != rb_adec_ranges.end())
 		{
 			rb::state_unexclude_async(it->second.first, it->second.second, "cellAdec instance closed");
+			rb::state_foreign_window(it->second.second, it->second.second + rb_adec_stream_window, false);
 			rb_adec_ranges.erase(it);
 		}
 	}

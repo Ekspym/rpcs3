@@ -74,6 +74,7 @@ namespace rb
 			u64 predicted_reads = 0;
 
 			u32 sync_addr = 0;
+			u32 sync_frame = 0; // RB_SYNC_FRAME: sync point at this port 0 read (recordings without the LCG seed)
 			bool synced = false;
 			s64 recorded_sync_seq[max_ports]{-1, -1};
 		};
@@ -154,6 +155,7 @@ namespace rb
 			std::string path = get_env("RB_FILE");
 			const std::string stats_path = get_env("RB_STATS");
 			g_state.sync_addr = static_cast<u32>(std::strtoul(get_env("RB_SYNC_ADDR").c_str(), nullptr, 16));
+			g_state.sync_frame = static_cast<u32>(std::strtoul(get_env("RB_SYNC_FRAME").c_str(), nullptr, 10));
 
 			// RB_NET_DUMP=1: every UDP packet of the game in the log (sys_net_dump trace) plus a marker per main loop frame
 			if (get_env("RB_NET_DUMP") == "1")
@@ -419,8 +421,8 @@ namespace rb
 			g_port0_reads++;
 		}
 
-		if (port_no == 0 && g_state.sync_addr && !g_state.synced && vm::check_addr<4>(g_state.sync_addr, vm::page_readable) &&
-			*vm::get_super_ptr<u32>(g_state.sync_addr) != 0u)
+		if (port_no == 0 && !g_state.synced && ((g_state.sync_frame && g_state.seq[0] >= g_state.sync_frame) ||
+			(g_state.sync_addr && vm::check_addr<4>(g_state.sync_addr, vm::page_readable) && *vm::get_super_ptr<u32>(g_state.sync_addr) != 0u)))
 		{
 			check_sync_point();
 		}
@@ -619,6 +621,9 @@ namespace rb
 	// in the snapshot) does not see them at all. Returns the lag (missed vblanks), 0 for re-simulated frames.
 	constexpr u32 tekken_frame_end = 0x005b39e0;
 	u64 g_boundary_frame = 0; // game frame of the current main loop iteration (after a possible restore)
+	// Main loop root of the current frame (FUN_00100250 argument): the global task list runs from *(root + 0x14) to the
+	// sentinel root + 4 through +0x10 (next); +0x14 prev, +0x18 parent, +0x1c next sibling, +0x20 prev sibling, +0x24 first child
+	u32 g_task_root = 0;
 
 	u32 rb_frame_end(ppu_thread& ppu, u64 param)
 	{
@@ -1688,6 +1693,7 @@ namespace rb
 		}
 
 		depth++;
+		g_task_root = root;
 		const auto t_start = std::chrono::steady_clock::now();
 		frame_boundary();
 		const auto t_state = std::chrono::steady_clock::now();
@@ -1928,6 +1934,123 @@ namespace rb
 		}
 
 		ppu.gpr[1] = old_r1;
+	}
+
+	void task_check(u64 game_frame, const char* when)
+	{
+		static const u64 from = []() -> u64
+		{
+			const std::string v = get_env("RB_TASK_CHECK");
+			return v.empty() ? umax : std::strtoull(v.c_str(), nullptr, 10);
+		}();
+
+		if (game_frame < from || !g_task_root)
+		{
+			return;
+		}
+
+		static u32 reported = 0;
+
+		if (reported >= 3)
+		{
+			return;
+		}
+
+		const auto rd = [](u32 addr) -> u32
+		{
+			return addr && vm::check_addr(addr, vm::page_readable, 4) ? static_cast<u32>(vm::read32(addr)) : 0u;
+		};
+
+		const auto describe = [&](const char* what, u32 n) -> std::string
+		{
+			if (!n || !vm::check_addr(n, vm::page_readable, 0x38))
+			{
+				return fmt::format(" %s 0x%08x (unreadable)", what, n);
+			}
+
+			return fmt::format(" %s 0x%08x [vt 0x%08x obj-vt 0x%08x next 0x%08x prev 0x%08x parent 0x%08x nsib 0x%08x psib 0x%08x child 0x%08x saved %d]",
+				what, n, rd(n), rd(n + rd(n + 0x34)), rd(n + 0x10), rd(n + 0x14), rd(n + 0x18), rd(n + 0x1c), rd(n + 0x20), rd(n + 0x24), state_addr_saved(n));
+		};
+
+		const auto violation = [&](const char* what, u32 n)
+		{
+			reported++;
+			const u32 next = rd(n + 0x10), prev = rd(n + 0x14);
+			rb_log.error("Task check %s, game frame %u (re-simulating %d): %s at node 0x%08x;%s%s%s%s", when, game_frame,
+				state_resimulating(game_frame), what, n, describe("node", n).c_str(), describe("next", next).c_str(), describe("prev", prev).c_str(),
+				describe("parent", rd(n + 0x18)).c_str());
+		};
+
+		const u32 sentinel = g_task_root + 4;
+		u32 n = rd(g_task_root + 0x14);
+		u32 count = 0;
+
+		for (; n != sentinel; count++)
+		{
+			if (count >= 20000)
+			{
+				violation("list longer than 20000 nodes (cycle?)", n);
+				return;
+			}
+
+			if (!n || !vm::check_addr(n, vm::page_readable, 0x28))
+			{
+				violation("unreadable node in the list", n);
+				return;
+			}
+
+			const u32 next = rd(n + 0x10);
+
+			if (!next)
+			{
+				violation("null next before the end of the list", n);
+				return;
+			}
+
+			if (rd(next + 0x14) != n)
+			{
+				violation("next->prev != node", n);
+				return;
+			}
+
+			n = next;
+		}
+
+		// FUN_000ff2b0(wall contents bank): the last node of the bank's subtree, where FUN_000ff914 inserts (crash at 5051 in zed1)
+		constexpr u32 wall_bank = 0x10388900;
+
+		if (rd(wall_bank) == 0x00912c68u)
+		{
+			u32 p = wall_bank, pred = 0;
+
+			for (u32 up = 0; up < 64 && p; up++)
+			{
+				if (const u32 sib = rd(p + 0x1c))
+				{
+					pred = rd(sib + 0x14);
+					break;
+				}
+
+				if (!rd(p + 0x18))
+				{
+					pred = rd(p + 0x14);
+					break;
+				}
+
+				p = rd(p + 0x18);
+			}
+
+			if (!pred || !rd(pred + 0x10))
+			{
+				violation(fmt::format("insert point of the wall bank 0x%08x (FUN_000ff2b0 = 0x%08x, from 0x%08x) has no next", wall_bank, pred, p).c_str(), pred);
+				return;
+			}
+		}
+
+		if (static u64 ok = 0; ++ok % 600 == 1)
+		{
+			rb_log.notice("Task check %s, game frame %u: %u nodes OK", when, game_frame, count);
+		}
 	}
 
 	void install_frame_hook()

@@ -72,6 +72,9 @@ namespace rb
 
 	// Main loop frame pieces, used by the netplay module for re-simulated frames
 	void run_task_walk(ppu_thread& ppu, u32 root); // one frame of the game (task walk of the main loop)
+	// RB_TASK_CHECK=<game frame>: from that frame on, checks the global task list of the main loop root (diagnostics; called
+	// by rb_state right after a snapshot load and right before a save). `when` = "after load" / "after frame".
+	void task_check(u64 game_frame, const char* when);
 	u64 sync_game_frame();
 	void force_sync_point(const char* reason);      // sync point now (online fight start)                         // game frame of the sync point (umax before it)
 	void begin_frame();                            // per-frame bookkeeping (virtual timebase, frame number)
@@ -99,5 +102,6 @@ namespace rb
 		void install_hooks(std::vector<u32>& applied);
 		bool is_resimulating();
 		bool fight_active(); // the online fight with prediction runs (rollbacks possible)
+		void stress_sound_after_load(u64 target); // RB_STRESS_SOUND: sound bookkeeping after an offline stress load
 	}
 }

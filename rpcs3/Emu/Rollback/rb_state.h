@@ -44,6 +44,10 @@ namespace rb
 	// From any thread (HLE modules): queued, applied by the main thread at the next save or load
 	void state_exclude_async(u32 begin, u32 end, const char* what);
 	void state_unexclude_async(u32 begin, u32 end, const char* what);
+	// From any thread: pages in [begin, end) whose writes the tracking misses (SPU DMA, host writes) become foreign (not
+	// rolled back) even with RB_SNAP_FOREIGN=3; PPU writes there stay game state. Used next to an open cellAdec instance
+	// (the game's AT3P stream ring buffer). add = false removes the window.
+	void state_foreign_window(u32 begin, u32 end, bool add);
 	void state_set_spu_busy_check(std::function<bool()> check);
 	std::vector<u32> state_saved_pages(); // pages of the snapshot (diagnostics) // RB_SNAP_NO_IDLE: learn only while no SPU job runs
 	// RB_SNAP_FOREIGN=2: pages first written by the network threads (or host writes), still saved and restored

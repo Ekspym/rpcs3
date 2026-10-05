@@ -97,6 +97,16 @@ namespace rb
 		bool g_foreign_named_only = false;
 		std::vector<u32> g_foreign_tracked;
 
+		// state_foreign_window: ranges where a write missed by the tracking makes the page foreign in every mode
+		std::mutex g_foreign_window_mutex;
+		std::vector<std::pair<u32, u32>> g_foreign_windows;
+
+		bool in_foreign_window(u32 addr)
+		{
+			std::lock_guard lock(g_foreign_window_mutex);
+			return std::any_of(g_foreign_windows.begin(), g_foreign_windows.end(), [&](const auto& w) { return addr >= w.first && addr < w.second; });
+		}
+
 		void mark_foreign(u32 page, const std::string& writer)
 		{
 			if (!g_foreign || g_foreign[page].exchange(1))
@@ -885,6 +895,13 @@ namespace rb
 						{
 							mark_foreign(addr >> 12, "a host write (missed by the tracking)");
 						}
+						else if (!g_foreign_track_only && in_foreign_window(addr))
+						{
+							// The game's AT3P stream ring next to a cellAdec instance (written by the sound SPU at audio rate):
+							// restored by a rollback, stale audio was played at every rollback (distorted hits) and the stream's
+							// producer/consumer could disagree (stage music stopped)
+							mark_foreign(addr >> 12, "a non-PPU writer next to a cellAdec instance (audio stream buffer)");
+						}
 						mark_dirty(i);
 					}
 				}
@@ -1504,6 +1521,17 @@ namespace rb
 		g_async_exclusions.push_back({begin, end, what, false});
 	}
 
+	void state_foreign_window(u32 begin, u32 end, bool add)
+	{
+		std::lock_guard lock(g_foreign_window_mutex);
+		std::erase(g_foreign_windows, std::pair{begin, end});
+
+		if (add)
+		{
+			g_foreign_windows.emplace_back(begin, end);
+		}
+	}
+
 	static void check_kernel_changes()
 	{
 		apply_async_exclusions();
@@ -1709,6 +1737,7 @@ namespace rb
 		}
 
 		const auto start = std::chrono::steady_clock::now();
+		task_check(game_frame, "after frame");
 		g_store.copy<true>(slot);
 		const u64 us = elapsed_us(start);
 
@@ -1743,6 +1772,7 @@ namespace rb
 		wait_for_draw_idle();
 		const auto start = std::chrono::steady_clock::now();
 		g_store.copy<false>(slot);
+		task_check(game_frame, "after load");
 		const u64 us = elapsed_us(start);
 
 		g_load_us_total += us;
@@ -1833,6 +1863,10 @@ namespace rb
 
 		if (g_stress_every && g_has_snapshot && game_frame > g_save_at)
 		{
+			// Pages marked foreign while already in the snapshot (named writer threads, audio stream windows) leave it here
+			// too: before, only state_net_save removed them and the stress ring kept restoring them
+			remove_foreign_pages();
+
 			// RB_SNAP_SAVE_IDLE=1: the draw thread must not be writing render data while the state is hashed
 			// (calibration) and saved; waiting between the two would let it change pages after their hash
 			static const bool save_idle = []() { const char* v = std::getenv("RB_SNAP_SAVE_IDLE"); return v && *v == '1'; }();
@@ -2153,6 +2187,7 @@ namespace rb
 					film_save();
 					g_store.copy<false>(to_slot);
 					film_restore();
+					task_check(to, "after load");
 
 					// Snapshots after the restored frame belong to the discarded timeline (online mode saves no boundary
 					// during the re-simulation, so they would otherwise stay valid for a second rollback)
@@ -2230,6 +2265,8 @@ namespace rb
 				film_save();
 				g_store.copy<false>(from_slot);
 				film_restore();
+				task_check(from, "after load");
+				online::stress_sound_after_load(from);
 				const u64 us = elapsed_us(start);
 
 				g_load_us_total += us;
@@ -2312,7 +2349,31 @@ namespace rb
 				}
 			}
 
+			// Pages first written in a re-simulated frame (a wall hit only in the corrected timeline, a cooled page written
+			// again) were otherwise added at the next live boundary with their old (shadow) content in every slot - also in
+			// this one, whose state already has the write. A rollback to it restored a mix of both timelines (task lists
+			// into the other timeline -> endless task walk, the online wall splat hang 2026-10-05).
+			// RB_SNAP_RESIM_CAL=0: old behaviour (diagnostics)
+			static const bool resim_cal = !std::getenv("RB_SNAP_RESIM_CAL") || *std::getenv("RB_SNAP_RESIM_CAL") != '0';
+
+			if (resim_cal && g_cal_continuous && g_cal_done && state_resimulating(game_frame))
+			{
+				if (const usz added = calibrate_step())
+				{
+					for (const u32 page : g_new_dirty_pages)
+					{
+						g_store.add(page, g_cal_shadow.data() + g_cal_index[page] * 0x1000ull);
+					}
+
+					if (static u32 reported = 0; reported++ < 100)
+					{
+						rb_log.notice("Snapshot: %u new pages before the re-simulated save of game frame %u (%s)", added, game_frame, fmt::merge(g_new_pages, ","));
+					}
+				}
+			}
+
 			const auto start = std::chrono::steady_clock::now();
+			task_check(game_frame, "after frame");
 			g_store.copy<true>(slot);
 			const u64 us = elapsed_us(start);
 
