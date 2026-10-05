@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/Rollback/rb_state.h"
 #include "sys_mmapper.h"
 
 #include "Emu/Cell/PPUThread.h"
@@ -207,6 +208,8 @@ error_code create_lv2_shm(bool pshared, u64 ipc_key, u64 size, u32 align, u64 fl
 
 error_code sys_mmapper_allocate_address(ppu_thread& ppu, u64 size, u64 flags, u64 alignment, vm::ptr<u32> alloc_addr)
 {
+	rb::state_kernel_change("sys_mmapper_allocate_address", static_cast<u32>(size)); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_mmapper.warning("sys_mmapper_allocate_address(size=0x%x, flags=0x%x, alignment=0x%x, alloc_addr=*0x%x)", size, flags, alignment, alloc_addr);
@@ -623,6 +626,8 @@ error_code sys_mmapper_change_address_access_right(ppu_thread& ppu, u32 addr, u6
 
 error_code sys_mmapper_free_address(ppu_thread& ppu, u32 addr)
 {
+	rb::state_kernel_change("sys_mmapper_free_address", addr); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_mmapper.warning("sys_mmapper_free_address(addr=0x%x)", addr);
@@ -727,6 +732,8 @@ error_code sys_mmapper_free_shared_memory(ppu_thread& ppu, u32 mem_id)
 
 error_code sys_mmapper_map_shared_memory(ppu_thread& ppu, u32 addr, u32 mem_id, u64 flags)
 {
+	rb::state_kernel_change("sys_mmapper_map_shared_memory", addr); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_mmapper.warning("sys_mmapper_map_shared_memory(addr=0x%x, mem_id=0x%x, flags=0x%x)", addr, mem_id, flags);
@@ -888,6 +895,8 @@ error_code sys_mmapper_search_and_map(ppu_thread& ppu, u32 start_addr, u32 mem_i
 
 error_code sys_mmapper_unmap_shared_memory(ppu_thread& ppu, u32 addr, vm::ptr<u32> mem_id)
 {
+	rb::state_kernel_change("sys_mmapper_unmap_shared_memory", addr); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_mmapper.warning("sys_mmapper_unmap_shared_memory(addr=0x%x, mem_id=*0x%x)", addr, mem_id);

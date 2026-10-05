@@ -1,0 +1,68 @@
+#pragma once
+
+#include <functional>
+
+#include "util/types.hpp"
+
+// Rollback experiment (Tekken 6): saving and restoring game state in guest memory.
+// Test mode controlled by environment variables, read once on first use:
+//   RB_SNAP_RANGES     = comma separated guest ranges (0xBEGIN-0xEND) that form the saved state
+//   RB_SNAP_SAVE_AT    = game frame at which the state is saved
+//   RB_SNAP_RESTORE_AT = game frame at which the saved state is restored and the input replay rewound
+namespace rb
+{
+	struct snapshot_info
+	{
+		u64 game_frame;
+		u32 seq[2];
+	};
+
+	// Called at the start of every port 0 pad read (frame boundary), before any input is consumed.
+	// Returns true when the state was restored and input positions must be rewound to `out`.
+	bool state_on_frame_start(u64 game_frame, const u32 (&seq)[2], snapshot_info& out);
+
+	// Stress test with prediction (RB_SNAP_PREDICT=1): frames that will be rolled back later are first
+	// simulated with a predicted input for port 1 (the last input before the rollback window, like GGPO).
+	// Returns true for such a frame and the game frame whose input is repeated.
+	bool state_is_speculative(u64 game_frame, u64& predicted_from);
+
+	// True for frames that are re-simulated after a stress test rollback (the frames before the one where the
+	// rollback happened); RB_FAST_RESIM runs them without rendering
+	bool state_resimulating(u64 game_frame);
+
+	// Write tracking of the calibrated pages (RB_SNAP_TRACK=1). on_write_fault is called by the access violation
+	// handler: true when the page was a tracked clean page (now dirty and writable). note_write is called by the
+	// RPCS3 paths that write guest memory through the unprotected view (128-byte atomic stores, reservations).
+	// Netplay (RB_NET=1): the snapshot ring is driven by GGPO. Ready once the first snapshot exists (RB_SNAP_SAVE_AT).
+	bool state_net_ready();
+	void state_net_set_resim(bool resim);
+	void state_net_save(u64 game_frame, const u32 (&seq)[2]);
+	bool state_net_load(u64 game_frame, snapshot_info& out);
+	// Excludes a range from save/restore (like RB_SNAP_EXCLUDE); must be called before the sync point
+	void state_exclude(u32 begin, u32 end, const char* what);
+	void state_set_spu_busy_check(std::function<bool()> check); // RB_SNAP_NO_IDLE: learn only while no SPU job runs
+	// RB_SNAP_FOREIGN=2: pages first written by the network threads (or host writes), still saved and restored
+	std::vector<u32> state_foreign_pages();
+	// A memory map change by the game (sys_memory_allocate/free, sys_mmapper): kernel state that a snapshot does not
+	// restore, so no snapshot taken before it may be loaded any more (called from any thread)
+	void state_kernel_change(const char* what, u32 addr);
+
+	// Online rollback through the snapshot ring of the stress test (RB_SNAP_STRESS_EVERY: a snapshot of every frame boundary,
+	// the restore at a frame boundary, the frames before the rollback frame are re-simulated): the online module requests a
+	// rollback to a game frame; it happens at the next frame boundary, `before` runs right before the restore, `after`
+	// right after it (both on the main thread)
+	void state_request_rollback(u64 to_frame, std::function<void()> before, std::function<void()> after, u64 max_depth = umax,
+		u64 max_tag = umax, u64 min_tag = 0);
+	// Online mode: a value stored with every snapshot (the remote simulated frame); a rollback request takes only a slot with
+	// min_tag <= tag <= max_tag
+	void state_set_save_tag(std::function<u64()> tag);
+	// A snapshot of every frame boundary exists (stress ring active)
+	bool state_stress_ready();
+	// Called before every snapshot of the stress ring (main thread); false = this frame boundary is not saved
+	void state_set_save_check(std::function<bool()> check);
+	// 1: the address is saved and restored by the snapshot, 0: not in the snapshot, 2: excluded
+	int state_addr_saved(u32 addr);
+
+	bool on_write_fault(u32 addr);
+	void note_write(u32 addr, u32 size);
+}

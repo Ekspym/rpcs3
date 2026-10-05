@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/Rollback/rb_state.h"
 
 #include "Emu/IdManager.h"
 
@@ -37,6 +38,8 @@ void lv2_mutex::save(utils::serial& ar)
 
 error_code sys_mutex_create(ppu_thread& ppu, vm::ptr<u32> mutex_id, vm::ptr<sys_mutex_attribute_t> attr)
 {
+	rb::state_kernel_change("sys_mutex_create", 0); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_mutex.trace("sys_mutex_create(mutex_id=*0x%x, attr=*0x%x)", mutex_id, attr);
@@ -105,6 +108,8 @@ error_code sys_mutex_create(ppu_thread& ppu, vm::ptr<u32> mutex_id, vm::ptr<sys_
 
 error_code sys_mutex_destroy(ppu_thread& ppu, u32 mutex_id)
 {
+	rb::state_kernel_change("sys_mutex_destroy", 0); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_mutex.trace("sys_mutex_destroy(mutex_id=0x%x)", mutex_id);

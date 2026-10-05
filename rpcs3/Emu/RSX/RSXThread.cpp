@@ -5,6 +5,7 @@
 #include "Common/surface_store.h"
 #include "Core/RSXReservationLock.hpp"
 #include "Core/RSXEngLock.hpp"
+#include "Emu/Rollback/rb_input.h"
 #include "Host/MM.h"
 #include "Host/RSXDMAWriter.h"
 #include "NV47/HW/context.h"
@@ -3648,6 +3649,7 @@ namespace rsx
 		}
 
 		int_flip_index += flip_notification_count;
+		rb::on_guest_flip();
 
 		current_display_buffer = buffer;
 		m_queued_flip.emu_flip = true;

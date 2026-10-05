@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/Rollback/rb_state.h"
 #include "sys_ppu_thread.h"
 
 #include "Emu/System.h"
@@ -80,6 +81,8 @@ constexpr u32 c_max_ppu_name_size = 28;
 
 void _sys_ppu_thread_exit(ppu_thread& ppu, u64 errorcode)
 {
+	rb::state_kernel_change("_sys_ppu_thread_exit", 0); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 	u64 writer_mask = 0;
 
@@ -472,6 +475,8 @@ error_code sys_ppu_thread_restart(ppu_thread& ppu)
 
 error_code _sys_ppu_thread_create(ppu_thread& ppu, vm::ptr<u64> thread_id, vm::ptr<ppu_thread_param_t> param, u64 arg, u64 unk, s32 prio, u64 _stacksz, u64 flags, vm::cptr<char> threadname)
 {
+	rb::state_kernel_change("_sys_ppu_thread_create", 0); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_ppu_thread.warning("_sys_ppu_thread_create(thread_id=*0x%x, param=*0x%x, arg=0x%llx, unk=0x%llx, prio=%d, stacksize=0x%llx, flags=0x%llx, threadname=*0x%x)",

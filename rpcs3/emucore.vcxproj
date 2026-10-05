@@ -385,6 +385,11 @@
     <ClCompile Include="Emu\Cell\Modules\cellOskDialog.cpp" />
     <ClCompile Include="Emu\Cell\Modules\cellOvis.cpp" />
     <ClCompile Include="Emu\Cell\Modules\cellPad.cpp" />
+    <ClCompile Include="Emu\Rollback\rb_input.cpp" />
+    <ClCompile Include="Emu\Rollback\rb_checksum.cpp" />
+    <ClCompile Include="Emu\Rollback\rb_state.cpp" />
+    <ClCompile Include="Emu\Rollback\rb_net.cpp" />
+    <ClCompile Include="Emu\Rollback\rb_online.cpp" />
     <ClCompile Include="Emu\Cell\Modules\cellPamf.cpp" />
     <ClCompile Include="Emu\Cell\Modules\cellPesmUtility.cpp" />
     <ClCompile Include="Emu\Cell\Modules\cellPhotoDecode.cpp" />
@@ -959,6 +964,9 @@
     <ClInclude Include="Emu\Cell\Modules\cellMusic.h" />
     <ClInclude Include="Emu\Cell\Modules\cellNetCtl.h" />
     <ClInclude Include="Emu\Cell\Modules\cellPad.h" />
+    <ClInclude Include="Emu\Rollback\rb_input.h" />
+    <ClInclude Include="Emu\Rollback\rb_checksum.h" />
+    <ClInclude Include="Emu\Rollback\rb_state.h" />
     <ClInclude Include="Emu\Cell\Modules\cellPamf.h" />
     <ClInclude Include="Emu\Cell\Modules\cellPng.h" />
     <ClInclude Include="Emu\Cell\Modules\cellPngDec.h" />

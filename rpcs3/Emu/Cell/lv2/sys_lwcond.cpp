@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/Rollback/rb_state.h"
 #include "sys_lwcond.h"
 
 #include "Emu/IdManager.h"
@@ -27,6 +28,8 @@ void lv2_lwcond::save(utils::serial& ar)
 
 error_code _sys_lwcond_create(ppu_thread& ppu, vm::ptr<u32> lwcond_id, u32 lwmutex_id, vm::ptr<sys_lwcond_t> control, u64 name)
 {
+	rb::state_kernel_change("_sys_lwcond_create", 0); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_lwcond.trace(u8"_sys_lwcond_create(lwcond_id=*0x%x, lwmutex_id=0x%x, control=*0x%x, name=0x%llx (“%s”))", lwcond_id, lwmutex_id, control, name, lv2_obj::name_64{std::bit_cast<be_t<u64>>(name)});
@@ -60,6 +63,8 @@ error_code _sys_lwcond_create(ppu_thread& ppu, vm::ptr<u32> lwcond_id, u32 lwmut
 
 error_code _sys_lwcond_destroy(ppu_thread& ppu, u32 lwcond_id)
 {
+	rb::state_kernel_change("_sys_lwcond_destroy", 0); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_lwcond.trace("_sys_lwcond_destroy(lwcond_id=0x%x)", lwcond_id);

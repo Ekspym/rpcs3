@@ -1,4 +1,6 @@
 #include "stdafx.h"
+#include <map>
+#include "Utilities/StrUtil.h"
 #include "Emu/system_config.h"
 #include "Emu/Cell/PPUModule.h"
 #include "Emu/Cell/timers.hpp"
@@ -93,6 +95,31 @@ error_code sys_lwmutex_destroy(ppu_thread& ppu, vm::ptr<sys_lwmutex_t> lwmutex)
 error_code sys_lwmutex_lock(ppu_thread& ppu, vm::ptr<sys_lwmutex_t> lwmutex, u64 timeout)
 {
 	sysPrxForUser.trace("sys_lwmutex_lock(lwmutex=*0x%x, timeout=0x%llx)", lwmutex, timeout);
+
+	// tekken-rollback diagnostics: RB_LWMUTEX_WATCH=<ptr>:<offset> - counts the threads that lock the lwmutex at
+	// *(ptr) + offset (e.g. the game's main heap lock 0x00B02A70:0x28)
+	if (static const auto watch = []() -> std::pair<u32, u32>
+		{
+			const char* v = std::getenv("RB_LWMUTEX_WATCH");
+			if (!v || !*v) return {0, 0};
+			const auto parts = fmt::split(v, {":"});
+			return {static_cast<u32>(std::strtoul(parts[0].c_str(), nullptr, 16)), parts.size() > 1 ? static_cast<u32>(std::strtoul(parts[1].c_str(), nullptr, 16)) : 0u};
+		}(); watch.first && vm::check_addr(watch.first) && lwmutex.addr() == vm::read32(watch.first) + watch.second)
+	{
+		static std::mutex m;
+		static std::map<std::string, u64> counts;
+		static u64 total = 0;
+		const auto name = ppu.ppu_tname.load();
+		std::lock_guard lock(m);
+		const u64 c = ++counts[name ? *name : "?"];
+
+		if (c == 1 || ++total % 20000 == 0)
+		{
+			std::string out;
+			for (const auto& [n, k] : counts) fmt::append(out, " %s=%u", n, k);
+			sysPrxForUser.error("RB_LWMUTEX_WATCH 0x%x lock counts:%s (lr=0x%x)", lwmutex.addr(), out, +ppu.lr);
+		}
+	}
 
 	if (g_cfg.core.hle_lwmutex)
 	{

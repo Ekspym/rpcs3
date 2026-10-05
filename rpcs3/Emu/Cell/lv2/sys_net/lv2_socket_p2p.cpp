@@ -4,7 +4,71 @@
 #include "network_context.h"
 #include "sys_net_helpers.h"
 
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+
 LOG_CHANNEL(sys_net);
+
+// tekken-rollback: RB_NET_LAG_MS=<ms> delays every outgoing P2P packet (simulated network latency for the local
+// online tests of two instances; both instances set it, so the round trip is twice the value). The online rollback
+// module switches it off outside of the fight with RB_FAST_MENU=1 (faster test setup).
+std::atomic<bool> g_rb_net_lag_active{true};
+
+namespace
+{
+	struct lagged_packet
+	{
+		std::chrono::steady_clock::time_point due;
+		socket_type socket;
+		std::vector<u8> data;
+		sockaddr_in addr;
+		int flags;
+	};
+
+	std::mutex g_lag_mutex;
+	std::condition_variable g_lag_cv;
+	std::deque<lagged_packet> g_lag_queue;
+
+	u32 lag_ms()
+	{
+		static const u32 ms = []() { const char* v = std::getenv("RB_NET_LAG_MS"); return v ? static_cast<u32>(std::atoi(v)) : 0u; }();
+		return g_rb_net_lag_active ? ms : 0;
+	}
+
+	void lag_send(socket_type socket, std::vector<u8> data, const sockaddr_in& addr, int flags)
+	{
+		static std::once_flag started;
+		std::call_once(started, []()
+		{
+			std::thread([]()
+			{
+				while (true)
+				{
+					std::unique_lock lock(g_lag_mutex);
+					g_lag_cv.wait(lock, [] { return !g_lag_queue.empty(); });
+
+					if (std::chrono::steady_clock::now() < g_lag_queue.front().due)
+					{
+						g_lag_cv.wait_until(lock, g_lag_queue.front().due);
+						continue;
+					}
+
+					lagged_packet p = std::move(g_lag_queue.front());
+					g_lag_queue.pop_front();
+					lock.unlock();
+					np::sendto_possibly_ipv6(p.socket, reinterpret_cast<const char*>(p.data.data()), ::size32(p.data), &p.addr, p.flags);
+				}
+			}).detach();
+		});
+
+		std::lock_guard lock(g_lag_mutex);
+		g_lag_queue.push_back({std::chrono::steady_clock::now() + std::chrono::milliseconds(lag_ms()), socket, std::move(data), addr, flags});
+		g_lag_cv.notify_one();
+	}
+}
 
 lv2_socket_p2p::lv2_socket_p2p(lv2_socket_family family, lv2_socket_type type, lv2_ip_protocol protocol)
 	: lv2_socket(family, type, protocol)
@@ -307,6 +371,13 @@ std::optional<s32> lv2_socket_p2p::sendto(s32 flags, const std::vector<u8>& buf,
 	if (flags & SYS_NET_MSG_WAITALL)
 	{
 		native_flags |= MSG_WAITALL;
+	}
+
+	if (lag_ms())
+	{
+		const s32 size = ::size32(buf);
+		lag_send(native_socket, std::move(p2p_data), native_addr, native_flags);
+		return {size};
 	}
 
 	auto native_result = np::sendto_possibly_ipv6(native_socket, reinterpret_cast<const char*>(p2p_data.data()), ::size32(p2p_data), &native_addr, native_flags);

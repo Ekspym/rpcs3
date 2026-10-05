@@ -2,6 +2,7 @@
 #include "Emu/Cell/PPUModule.h"
 
 #include "Utilities/bin_patch.h"
+#include "Emu/Rollback/rb_input.h"
 #include "Utilities/StrUtil.h"
 #include "Utilities/address_range.h"
 #include "util/serialization.hpp"
@@ -2516,6 +2517,12 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 
 	// Initialize HLE modules
 	ppu_initialize_modules(&link, ar);
+
+	// Rollback frame hook: needs the HLE function stubs (initialized above), must precede analysis/compilation
+	if (!ar)
+	{
+		rb::install_static_hooks(applied);
+	}
 
 	// Embedded SPU elf patching
 	for (const auto& seg : _main.segs)

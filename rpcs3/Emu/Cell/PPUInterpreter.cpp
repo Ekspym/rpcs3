@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "PPUInterpreter.h"
+#include "Emu/Rollback/rb_input.h"
 
 #include "Emu/Memory/vm_reservation.h"
 #include "Emu/system_config.h"
@@ -4792,8 +4793,8 @@ auto MFSPR()
 	case 0x009: ppu.gpr[op.rd] = ppu.ctr; break;
 	case 0x100: ppu.gpr[op.rd] = ppu.vrsave; break;
 
-	case 0x10C: ppu.gpr[op.rd] = get_timebased_time(); break;
-	case 0x10D: ppu.gpr[op.rd] = get_timebased_time() >> 32; break;
+	case 0x10C: ppu.gpr[op.rd] = rb::guest_timebase(); break;
+	case 0x10D: ppu.gpr[op.rd] = rb::guest_timebase() >> 32; break;
 	default: fmt::throw_exception("MFSPR 0x%x", n);
 	}
 
@@ -4862,8 +4863,8 @@ auto MFTB()
 
 	switch (n)
 	{
-	case 0x10C: ppu.gpr[op.rd] = get_timebased_time(); break;
-	case 0x10D: ppu.gpr[op.rd] = get_timebased_time() >> 32; break;
+	case 0x10C: ppu.gpr[op.rd] = rb::guest_timebase(); break;
+	case 0x10D: ppu.gpr[op.rd] = rb::guest_timebase() >> 32; break;
 	default: fmt::throw_exception("MFTB 0x%x", n);
 	}
 

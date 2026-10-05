@@ -43,6 +43,7 @@
 #include "rpcs3_version.h"
 
 #include "Utilities/StrUtil.h"
+#include "Emu/Rollback/rb_input.h"
 
 #include "../Crypto/unself.h"
 #include "util/logs.hpp"
@@ -1069,6 +1070,13 @@ game_boot_result Emulator::BootGame(const std::string& path, const std::string& 
 	if (m_restrict_emu_state_change)
 	{
 		return game_boot_result::currently_restricted;
+	}
+
+	// Rollback: every boot of Tekken needs a fresh process (the rollback state is per process)
+	if (IsStopped() && rb::relaunch_for_boot(path))
+	{
+		CallFromMainThread([]() { Emu.Quit(true); });
+		return game_boot_result::no_errors;
 	}
 
 	auto save_args = std::make_tuple(m_path, m_path_original, argv, envp, data, disc, klic, hdd1, m_config_mode, m_config_path, m_db_config);
@@ -3146,6 +3154,16 @@ bool Emulator::Pause(bool freeze_emulation, bool show_resume_message)
 
 	if (freeze_emulation)
 	{
+		// Rollback experiment: registers and call stack of the PPU thread that froze emulation (e.g. access violation)
+		if (const auto ppu = get_current_cpu_thread<ppu_thread>())
+		{
+			std::any custom_data;
+			std::string regs;
+			ppu->dump_regs(regs, custom_data);
+			sys_log.notice("Frozen PPU registers:\n%s", regs);
+			sys_log.notice("Frozen PPU call stack:\n%s", ppu->dump_callstack());
+		}
+
 		sys_log.warning("Emulation has been frozen! You can either use debugger tools to inspect current emulation state or terminate it.");
 	}
 	else
@@ -4312,6 +4330,24 @@ game_boot_result Emulator::Restart(bool graceful, bool reset_path)
 	{
 		// Emulation stop is in progress
 		return game_boot_result::still_running;
+	}
+
+	// Rollback: the restarted game gets a fresh process too (after this one stopped: P2P port, RPCN login)
+	if (rb::relaunch_pending())
+	{
+		const std::string path = !m_path_real.empty() ? m_path_real : !m_path_original.empty() ? m_path_original : m_path;
+
+		CallFromMainThread([path]()
+		{
+			Emu.Kill(false);
+
+			if (rb::relaunch_for_boot(path))
+			{
+				Emu.Quit(true);
+			}
+		});
+
+		return game_boot_result::no_errors;
 	}
 
 	Emu.after_kill_callback = [this, reset_path]

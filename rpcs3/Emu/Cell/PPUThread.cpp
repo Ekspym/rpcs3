@@ -16,6 +16,8 @@
 #include "Emu/system_utils.hpp"
 #include "Emu/System.h"
 #include "PPUThread.h"
+#include "Emu/Rollback/rb_input.h"
+#include "Emu/Rollback/rb_state.h"
 #include "PPUInterpreter.h"
 #include "PPUAnalyser.h"
 #include "PPUModule.h"
@@ -3575,6 +3577,7 @@ template <typename T>
 static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 {
 	perf_meter<"STCX"_u32> perf0;
+	rb::note_write(addr, sizeof(T));
 
 	if (addr % sizeof(T))
 	{
@@ -4955,7 +4958,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 			{ "__check", reinterpret_cast<u64>(&ppu_check) },
 			{ "__trace", reinterpret_cast<u64>(&ppu_trace) },
 			{ "__syscall", reinterpret_cast<u64>(ppu_execute_syscall) },
-			{ "__get_tb", reinterpret_cast<u64>(get_timebased_time) },
+			{ "__get_tb", reinterpret_cast<u64>(rb::guest_timebase) },
 			{ "__lwarx", reinterpret_cast<u64>(ppu_lwarx) },
 			{ "__ldarx", reinterpret_cast<u64>(ppu_ldarx) },
 			{ "__stwcx", reinterpret_cast<u64>(ppu_stwcx) },

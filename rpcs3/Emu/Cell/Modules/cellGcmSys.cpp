@@ -5,6 +5,7 @@
 #include "Emu/Memory/vm.h"
 #include "Emu/Cell/lv2/sys_ppu_thread.h"
 #include "Emu/Cell/lv2/sys_rsx.h"
+#include "Emu/Rollback/rb_input.h"
 #include "Emu/RSX/RSXThread.h"
 
 #include "cellGcmSys.h"
@@ -480,6 +481,7 @@ void cellGcmResetFlipStatus()
 {
 	cellGcmSys.trace("cellGcmResetFlipStatus()");
 
+	rb::on_reset_flip_status();
 	rsx::get_current_renderer()->flip_status = CELL_GCM_DISPLAY_FLIP_STATUS_WAITING;
 }
 

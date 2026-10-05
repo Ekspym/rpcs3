@@ -295,6 +295,11 @@ target_sources(rpcs3_emu PRIVATE
     Cell/Modules/cellOskDialog.cpp
     Cell/Modules/cellOvis.cpp
     Cell/Modules/cellPad.cpp
+    Rollback/rb_input.cpp
+    Rollback/rb_checksum.cpp
+    Rollback/rb_state.cpp
+    Rollback/rb_net.cpp
+    Rollback/rb_online.cpp
     Cell/Modules/cellPamf.cpp
     Cell/Modules/cellPesmUtility.cpp
     Cell/Modules/cellPhotoDecode.cpp

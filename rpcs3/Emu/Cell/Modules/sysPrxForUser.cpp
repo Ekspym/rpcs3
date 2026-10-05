@@ -8,6 +8,7 @@
 #include "Emu/Cell/lv2/sys_ss.h"
 #include "Emu/Cell/lv2/sys_tty.h"
 #include "sysPrxForUser.h"
+#include "Emu/Rollback/rb_input.h"
 
 LOG_CHANNEL(sysPrxForUser);
 
@@ -21,6 +22,17 @@ u64 sys_time_get_system_time()
 	sysPrxForUser.trace("sys_time_get_system_time()");
 
 	return get_guest_system_time();
+}
+
+// Registered in place of sys_time_get_system_time: lets the rollback module make selected callers frame based
+static u64 sys_time_get_system_time_rb(ppu_thread& ppu)
+{
+	if (u64 usec; rb::get_frame_system_time(static_cast<u32>(ppu.lr), usec))
+	{
+		return usec;
+	}
+
+	return sys_time_get_system_time();
 }
 
 void sys_process_exit(ppu_thread& ppu, s32 status)
@@ -234,7 +246,7 @@ DECLARE(ppu_module_manager::sysPrxForUser)("sysPrxForUser", [](ppu_static_module
 	REG_VAR(sysPrxForUser, g_ppu_atexitspawn).flag(MFF_HIDDEN);
 	REG_VAR(sysPrxForUser, g_ppu_at_Exitspawn).flag(MFF_HIDDEN);
 
-	REG_FUNC(sysPrxForUser, sys_time_get_system_time);
+	REG_FNID(sysPrxForUser, "sys_time_get_system_time", sys_time_get_system_time_rb);
 
 	REG_FUNC(sysPrxForUser, sys_process_exit);
 	REG_FUNC(sysPrxForUser, _sys_process_atexitspawn);

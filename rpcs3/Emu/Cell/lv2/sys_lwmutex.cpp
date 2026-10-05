@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/Rollback/rb_state.h"
 #include "sys_lwmutex.h"
 
 #include "Emu/IdManager.h"
@@ -25,6 +26,8 @@ void lv2_lwmutex::save(utils::serial& ar)
 
 error_code _sys_lwmutex_create(ppu_thread& ppu, vm::ptr<u32> lwmutex_id, u32 protocol, vm::ptr<sys_lwmutex_t> control, s32 has_name, u64 name)
 {
+	rb::state_kernel_change("_sys_lwmutex_create", 0); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_lwmutex.trace(u8"_sys_lwmutex_create(lwmutex_id=*0x%x, protocol=0x%x, control=*0x%x, has_name=0x%x, name=0x%llx (“%s”))", lwmutex_id, protocol, control, has_name, name, lv2_obj::name_64{std::bit_cast<be_t<u64>>(name)});
@@ -52,6 +55,8 @@ error_code _sys_lwmutex_create(ppu_thread& ppu, vm::ptr<u32> lwmutex_id, u32 pro
 
 error_code _sys_lwmutex_destroy(ppu_thread& ppu, u32 lwmutex_id)
 {
+	rb::state_kernel_change("_sys_lwmutex_destroy", 0); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_lwmutex.trace("_sys_lwmutex_destroy(lwmutex_id=0x%x)", lwmutex_id);

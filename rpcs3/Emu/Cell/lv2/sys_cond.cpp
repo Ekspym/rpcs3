@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/Rollback/rb_state.h"
 
 #include "util/serialization.hpp"
 #include "Emu/IdManager.h"
@@ -82,6 +83,8 @@ void lv2_cond::save(utils::serial& ar)
 
 error_code sys_cond_create(ppu_thread& ppu, vm::ptr<u32> cond_id, u32 mutex_id, vm::ptr<sys_cond_attribute_t> attr)
 {
+	rb::state_kernel_change("sys_cond_create", 0); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_cond.trace("sys_cond_create(cond_id=*0x%x, mutex_id=0x%x, attr=*0x%x)", cond_id, mutex_id, attr);
@@ -121,6 +124,8 @@ error_code sys_cond_create(ppu_thread& ppu, vm::ptr<u32> cond_id, u32 mutex_id, 
 
 error_code sys_cond_destroy(ppu_thread& ppu, u32 cond_id)
 {
+	rb::state_kernel_change("sys_cond_destroy", 0); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_cond.trace("sys_cond_destroy(cond_id=0x%x)", cond_id);

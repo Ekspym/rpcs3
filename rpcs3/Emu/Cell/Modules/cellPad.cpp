@@ -5,6 +5,7 @@
 #include "Emu/Cell/lv2/sys_process.h"
 #include "Emu/Io/pad_types.h"
 #include "Emu/RSX/Overlays/overlay_debug_overlay.h"
+#include "Emu/Rollback/rb_input.h"
 #include "Input/pad_thread.h"
 #include "Input/product_info.h"
 #include "cellPad.h"
@@ -692,10 +693,8 @@ void pad_get_data(u32 port_no, CellPadData* data, bool get_periph_data = false)
 	}
 }
 
-error_code cellPadGetData(u32 port_no, vm::ptr<CellPadData> data)
+static error_code cellPadGetData_locked(u32 port_no, vm::ptr<CellPadData> data)
 {
-	cellPad.trace("cellPadGetData(port_no=%d, data=*0x%x)", port_no, data);
-
 	std::lock_guard lock(pad::g_pad_mutex);
 
 	auto& config = g_fxo->get<pad_info>();
@@ -717,6 +716,7 @@ error_code cellPadGetData(u32 port_no, vm::ptr<CellPadData> data)
 		return not_an_error(CELL_PAD_ERROR_NO_DEVICE);
 
 	pad_get_data(port_no, data.get_ptr());
+	rb::on_pad_get_data(port_no, data.get_ptr());
 
 	if (g_cfg.io.pad_debug_overlay && !g_cfg.video.debug_overlay && port_no == 0)
 	{
@@ -724,6 +724,20 @@ error_code cellPadGetData(u32 port_no, vm::ptr<CellPadData> data)
 	}
 
 	return CELL_OK;
+}
+
+error_code cellPadGetData(u32 port_no, vm::ptr<CellPadData> data)
+{
+	cellPad.trace("cellPadGetData(port_no=%d, data=*0x%x)", port_no, data);
+
+	// Outside of g_pad_mutex: may suspend all threads to save or restore the game state
+	rb::before_pad_get_data(port_no);
+
+	const error_code res = cellPadGetData_locked(port_no, data);
+
+	// Outside of g_pad_mutex: may suspend all threads for a memory checksum
+	rb::after_pad_get_data(port_no);
+	return res;
 }
 
 error_code cellPadPeriphGetInfo(vm::ptr<CellPadPeriphInfo> info)

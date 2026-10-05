@@ -5,6 +5,7 @@
 #include "Emu/system_config.h"
 #include "Emu/Cell/ErrorCodes.h"
 #include "Emu/Cell/timers.hpp"
+#include "Emu/Rollback/rb_input.h"
 #include "util/tsc.hpp"
 
 #include "util/sysinfo.hpp"
@@ -347,6 +348,19 @@ error_code sys_time_get_current_time(vm::ptr<s64> sec, vm::ptr<s64> nsec)
 	if (!sec)
 	{
 		return CELL_EFAULT;
+	}
+
+	if (s64 fsec, fnsec; rb::get_fixed_time(fsec, fnsec))
+	{
+		*sec = fsec;
+
+		if (!nsec)
+		{
+			return CELL_EFAULT;
+		}
+
+		*nsec = fnsec;
+		return CELL_OK;
 	}
 
 #ifdef _WIN32

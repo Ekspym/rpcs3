@@ -6,6 +6,7 @@
 #include "Emu/Cell/lv2/sys_event.h"
 #include "Emu/Cell/lv2/sys_process.h"
 #include "Emu/RSX/RSXThread.h"
+#include "Emu/Rollback/rb_state.h"
 #include "Emu/system_config.h"
 #include "Thread.h"
 #include "Utilities/JIT.h"
@@ -1551,6 +1552,12 @@ namespace rsx
 bool handle_access_violation(u32 addr, bool is_writing, bool is_exec, ucontext_t* context) noexcept
 {
 	g_tls_fault_all++;
+
+	// Rollback snapshot write tracking: first write to a tracked read-only page
+	if (!is_exec && rb::on_write_fault(addr))
+	{
+		return true;
+	}
 
 	const auto cpu = get_current_cpu_thread();
 

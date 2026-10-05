@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/Rollback/rb_state.h"
 #include "sys_event.h"
 
 #include "Emu/IdManager.h"
@@ -222,6 +223,8 @@ CellError lv2_event_queue::send(lv2_event event, bool* notified_thread, lv2_even
 
 error_code sys_event_queue_create(cpu_thread& cpu, vm::ptr<u32> equeue_id, vm::ptr<sys_event_queue_attribute_t> attr, u64 ipc_key, s32 size)
 {
+	rb::state_kernel_change("sys_event_queue_create", 0); // tekken-rollback
+
 	cpu.state += cpu_flag::wait;
 
 	sys_event.warning("sys_event_queue_create(equeue_id=*0x%x, attr=*0x%x, ipc_key=0x%llx, size=%d)", equeue_id, attr, ipc_key, size);
@@ -266,6 +269,8 @@ error_code sys_event_queue_create(cpu_thread& cpu, vm::ptr<u32> equeue_id, vm::p
 
 error_code sys_event_queue_destroy(ppu_thread& ppu, u32 equeue_id, s32 mode)
 {
+	rb::state_kernel_change("sys_event_queue_destroy", 0); // tekken-rollback
+
 	ppu.state += cpu_flag::wait;
 
 	sys_event.warning("sys_event_queue_destroy(equeue_id=0x%x, mode=%d)", equeue_id, mode);

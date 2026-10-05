@@ -91,6 +91,33 @@ std::shared_ptr<rpcn::rpcn_client> get_rpcn_connection(QWidget* parent)
 	return rpcn;
 }
 
+// tekken-rollback: RB_RPCN_CREATE=1 creates the account of rpcn.yml (NPID and derived password) on the configured
+// server without the dialogs. Used for the local test server (test accounts of the netplay test instances).
+void rb_rpcn_autocreate()
+{
+	const char* v = std::getenv("RB_RPCN_CREATE");
+
+	if (!v || *v != '1')
+	{
+		return;
+	}
+
+	g_cfg_rpcn.load();
+	const std::string npid = g_cfg_rpcn.get_npid();
+	const std::string password = g_cfg_rpcn.get_password();
+	const auto rpcn = rpcn::rpcn_client::get_instance(0);
+
+	if (auto result = rpcn->wait_for_connection(); result != rpcn::rpcn_state::failure_no_failure)
+	{
+		rpcn_settings_log.error("RB_RPCN_CREATE: connection failed: %s", rpcn::rpcn_state_to_string(result));
+		return;
+	}
+
+	const auto error = rpcn->create_user(npid, password, npid, "https://rpcs3.net/cdn/netplay/DefaultAvatar.png", npid + "@localhost.test");
+	rpcn_settings_log.success("RB_RPCN_CREATE: account %s on %s: %s", npid, g_cfg_rpcn.get_host(),
+		error == rpcn::ErrorType::NoError ? "created" : error == rpcn::ErrorType::CreationExistingUsername ? "already exists" : "error");
+}
+
 rpcn_settings_dialog::rpcn_settings_dialog(QWidget* parent)
 	: QDialog(parent)
 {

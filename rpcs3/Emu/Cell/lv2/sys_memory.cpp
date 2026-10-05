@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/Rollback/rb_state.h"
 #include "sys_memory.h"
 
 #include "Emu/Memory/vm_locking.h"
@@ -170,6 +171,8 @@ u32 allocate_user_memory(u32 size, u32 align)
 
 error_code sys_memory_allocate(cpu_thread& cpu, u64 size, u64 flags, vm::ptr<u32> alloc_addr)
 {
+	rb::state_kernel_change("sys_memory_allocate", static_cast<u32>(size)); // tekken-rollback
+
 	cpu.state += cpu_flag::wait;
 
 	sys_memory.warning("sys_memory_allocate(size=0x%x, flags=0x%llx, alloc_addr=*0x%x)", size, flags, alloc_addr);
@@ -228,6 +231,8 @@ error_code sys_memory_allocate(cpu_thread& cpu, u64 size, u64 flags, vm::ptr<u32
 
 error_code sys_memory_allocate_from_container(cpu_thread& cpu, u64 size, u32 cid, u64 flags, vm::ptr<u32> alloc_addr)
 {
+	rb::state_kernel_change("sys_memory_allocate_from_container", static_cast<u32>(size)); // tekken-rollback
+
 	cpu.state += cpu_flag::wait;
 
 	sys_memory.warning("sys_memory_allocate_from_container(size=0x%x, cid=0x%x, flags=0x%llx, alloc_addr=*0x%x)", size, cid, flags, alloc_addr);
@@ -298,6 +303,8 @@ error_code sys_memory_allocate_from_container(cpu_thread& cpu, u64 size, u32 cid
 
 error_code sys_memory_free(cpu_thread& cpu, u32 addr)
 {
+	rb::state_kernel_change("sys_memory_free", addr); // tekken-rollback
+
 	cpu.state += cpu_flag::wait;
 
 	sys_memory.warning("sys_memory_free(addr=0x%x)", addr);

@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/Rollback/rb_state.h"
 #include "Utilities/JIT.h"
 #include "Utilities/date_time.h"
 #include "Emu/Memory/vm.h"
@@ -3390,6 +3391,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 
 	// Store conditionally
 	const u32 addr = args.eal & -128;
+	rb::note_write(addr, 128);
 
 	if ([&]()
 	{
@@ -3568,6 +3570,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 void do_cell_atomic_128_store(u32 addr, const void* to_write)
 {
 	perf_meter<"STORE128"_u64> perf0;
+	rb::note_write(addr, 128);
 
 	const auto cpu = get_current_cpu_thread();
 	rsx::reservation_lock rsx_lock(addr, 128);

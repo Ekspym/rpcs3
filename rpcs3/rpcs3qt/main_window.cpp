@@ -211,6 +211,10 @@ void main_window::Init()
 	CreateDockWindows();
 	CreateConnects();
 
+	// tekken-rollback: test accounts on the local RPCN server (RB_RPCN_CREATE=1)
+	extern void rb_rpcn_autocreate();
+	rb_rpcn_autocreate();
+
 	setMinimumSize(350, minimumSizeHint().height());    // seems fine on win 10
 	setWindowTitle(QString::fromStdString("RPCS3 " + rpcs3::get_verbose_version()));
 
