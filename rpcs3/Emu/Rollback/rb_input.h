@@ -45,7 +45,8 @@ namespace rb
 	bool relaunch_pending(); // a further boot in this process would need relaunch_for_boot
 
 	// RB_RESIM_FILM=0: the match recording stays outside the rollback (copied before a snapshot load, written back after)
-	u32 net_manager_object(); // tnOnlineBattle_Manager object seen in the task walk (0 = none)
+	u32 net_manager_object();
+	bool in_cosmetic_work(); // inside work that re-simulated frames leave out (draw pass, RB_RESIM_SKIP tasks) // tnOnlineBattle_Manager object seen in the task walk (0 = none)
 	u32 last_game_mode(); // game mode (FUN_0020c754) seen by the last re-simulated draw pass (diagnostics)
 	void film_save();
 	void film_restore();

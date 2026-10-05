@@ -144,6 +144,14 @@ namespace rb::online
 		std::map<u32, entry_t> g_remote;    // real remote inputs (simulated frame -> entry)
 		u32 g_remote_last = 0;              // highest real remote frame + 1
 		u32 g_mismatch_frame = umax;        // earliest remote frame that was mispredicted
+
+		// Time synchronisation (RB_ONLINE_SYNC_TARGET, default 1 frame; 0 = off): the side that runs ahead of the other in
+		// time keeps predicting the remote inputs (the user's test: 932 rollbacks of ~3 frames on one side, 18 on the other at
+		// 15 ms ping). When the predicted frames (remote simulated - remote available, averaged) exceed the target, one frame
+		// waits for the remote input instead of predicting (at most every 8th frame), like GGPO's frame advantage balancing.
+		bool g_sync_hold = false;
+		double g_sync_avg = 0.0;
+		u64 g_sync_last_hold = 0, g_sync_holds = 0;
 		u64 g_predictions = 0, g_mispredictions = 0, g_rollbacks = 0, g_resim_frames = 0;
 		u64 g_dbg_get_remote = 0, g_dbg_get_missing = 0, g_dbg_store_remote = 0, g_dbg_store_local = 0;
 
@@ -475,7 +483,7 @@ namespace rb::online
 			const bool resim = is_resimulating();
 
 			if (config().predict && mode == 1 && in_fight() && ring_ready() && !g_sim_at.empty() && player == remote_player(mgr) && sim > 0 &&
-				((resim && sim <= g_resim_sim_limit) || (sim < available + config().max_predict && !too_old)) && (vm::read8(flag_addr(mgr, i, sim - 1)) & 1))
+				((resim && sim <= g_resim_sim_limit) || (sim < available + config().max_predict && !too_old && !g_sync_hold)) && (vm::read8(flag_addr(mgr, i, sim - 1)) & 1))
 			{
 				const entry_t prev = read_entry(slot_addr(mgr, i, sim - 1));
 				std::memcpy(vm::get_super_ptr<u8>(slot_addr(mgr, i, sim)), prev.data(), entry_size);
@@ -1213,6 +1221,7 @@ namespace rb::online
 		u64 frame;
 		u32 out, bank, cue, handle;
 		bool claimed;
+		bool cosmetic = false; // started by work left out of re-simulated frames (drawing, effects): never stopped
 	};
 
 	std::deque<sound_play_t> g_sound_plays;
@@ -1299,7 +1308,7 @@ namespace rb::online
 
 		if (ret == 0 && out && sound_dedup() && fight_active())
 		{
-			g_sound_plays.push_back({seq[0], out, bank, cue, vm::read32(out), resim});
+			g_sound_plays.push_back({seq[0], out, bank, cue, vm::read32(out), resim, in_cosmetic_work()});
 		}
 
 		return ret;
@@ -1327,7 +1336,7 @@ namespace rb::online
 
 			for (auto it = g_sound_plays.begin(); it != g_sound_plays.end();)
 			{
-				if (it->frame >= g_sound_resim_first && it->frame < seq[0] && !it->claimed)
+				if (it->frame >= g_sound_resim_first && it->frame < seq[0] && !it->claimed && !it->cosmetic)
 				{
 					auto& ppu = *get_current_cpu_thread<ppu_thread>();
 					const u32 old_r1 = static_cast<u32>(ppu.gpr[1]);
@@ -1622,20 +1631,46 @@ namespace rb::online
 			const u32 base = vm::read32(ptr);
 			const u32 obj = base + offset;
 
+			// A job that did not finish twice in a row is not waited for again until it finishes (the user's KO: every
+			// boundary waited 20 ms for a job that never ran, frames took 22-24 ms and no snapshot was saved)
+			static std::map<u32, u32> stuck;
+
 			if (base && vm::check_addr(obj, vm::page_readable) && vm::check_addr(obj + 0x308, vm::page_readable) &&
 				vm::read32(obj + 0x304) && vm::read32(obj + 0x308) && vm::read32(obj + 0x14))
 			{
+				if (vm::read16(obj + 0x200) != 0)
+				{
+					stuck[obj] = 0;
+					continue;
+				}
+
+				if (stuck[obj] >= 2)
+				{
+					continue;
+				}
+
 				const auto t0 = std::chrono::steady_clock::now();
 
 				while (vm::read16(obj + 0x200) == 0)
 				{
 					if (ppu.is_stopped() || std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(max_wait_us))
 					{
+						if (max_wait_us >= 20000 && ++stuck[obj] == 2)
+						{
+							rb_online_log.warning("SPURS job 0x%08x did not finish twice, not waited for any more until it does", obj);
+						}
+
 						return true;
 					}
 
 					sys_timer_usleep(ppu, 50);
 				}
+
+				stuck[obj] = 0;
+			}
+			else
+			{
+				stuck[obj] = 0;
 			}
 		}
 
@@ -2143,6 +2178,39 @@ namespace rb::online
 
 		sound_frame();
 		g_fight_frames = mgr && fight_markers() ? g_fight_frames + 1 : 0;
+
+		// Time synchronisation (see g_sync_hold): measured in live fight frames only
+		{
+			static const double target = std::getenv("RB_ONLINE_SYNC_TARGET") ? std::atof(std::getenv("RB_ONLINE_SYNC_TARGET")) : 1.0;
+			u32 sq[2]{};
+			get_seq(sq);
+			g_sync_hold = false;
+
+			if (target > 0 && mgr && in_fight() && !state_resimulating(sq[0]))
+			{
+				const u32 r = remote_player(mgr) - 1;
+				const u32 rsim = vm::read32(mgr + 0x60 + r * 4);
+				const u32 ravail = vm::read32(mgr + 0x58 + r * 4);
+				const double ahead = rsim > ravail ? static_cast<double>(rsim - ravail) : 0.0;
+				g_sync_avg += (ahead - g_sync_avg) / 30.0;
+
+				if (g_sync_avg > target + 0.75 && sq[0] - g_sync_last_hold >= 8)
+				{
+					g_sync_hold = true;
+					g_sync_last_hold = sq[0];
+					g_sync_holds++;
+				}
+
+				if (static u64 n = 0; ++n % 600 == 0)
+				{
+					rb_online_log.notice("Time sync: %.2f frames predicted on average, %u frames waited so far (target %.1f)", g_sync_avg, g_sync_holds, target);
+				}
+			}
+			else if (!mgr || !in_fight())
+			{
+				g_sync_avg = 0.0;
+			}
+		}
 
 		// RB_FAST_MENU=1 (tests): until the fight runs, the game runs at RB_FAST_MENU_RATE vblanks per second (the game counts
 		// its frames by vblank, so boot, menus and the character select go faster) and without the simulated network lag

@@ -758,7 +758,10 @@ namespace rb
 	// logic never sees the cosmetic draws, live or re-simulated - the same rule on both PCs keeps them in sync.
 	class cosmetic_rng_scope
 	{
+	public:
 		static inline u32 s_depth = 0;
+
+	private:
 		static inline bool s_init = false;
 		static inline std::array<u8, 0xdc> s_rand{};
 		static inline u32 s_lcg = 0;
@@ -889,6 +892,11 @@ namespace rb
 				rb_log.success("Early send: local input sent right after the input task (manager 0x%08x)", mgr);
 			}
 		}
+	}
+
+	bool in_cosmetic_work()
+	{
+		return cosmetic_rng_scope::s_depth != 0;
 	}
 
 	u32 try_skip_task(ppu_thread& ppu, u32 node, bool resim)
@@ -1922,6 +1930,20 @@ namespace rb
 		{
 			rb_log.error("Relaunch: executable path unknown (%u)", GetLastError());
 			return false;
+		}
+
+		// The new process overwrites RPCS3.log: this one's log is kept as RPCS3_prev_<time>.log (diagnostics of what happened before)
+		{
+			const std::string dir = fs::get_log_dir();
+			const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+			std::tm tm{};
+			localtime_s(&tm, &now);
+			const std::string copy = fmt::format("%sRPCS3_prev_%04d%02d%02d_%02d%02d%02d.log", dir, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+			if (!fs::copy_file(dir + "RPCS3.log", copy, true))
+			{
+				rb_log.error("Relaunch: log copy '%s' failed (%s)", copy, fs::g_tls_error);
+			}
 		}
 
 		// The environment (RB_* variables of hrat_online.bat) is inherited
