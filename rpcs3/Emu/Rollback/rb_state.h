@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <vector>
 
 #include "util/types.hpp"
 
@@ -40,7 +41,11 @@ namespace rb
 	bool state_net_load(u64 game_frame, snapshot_info& out);
 	// Excludes a range from save/restore (like RB_SNAP_EXCLUDE); must be called before the sync point
 	void state_exclude(u32 begin, u32 end, const char* what);
-	void state_set_spu_busy_check(std::function<bool()> check); // RB_SNAP_NO_IDLE: learn only while no SPU job runs
+	// From any thread (HLE modules): queued, applied by the main thread at the next save or load
+	void state_exclude_async(u32 begin, u32 end, const char* what);
+	void state_unexclude_async(u32 begin, u32 end, const char* what);
+	void state_set_spu_busy_check(std::function<bool()> check);
+	std::vector<u32> state_saved_pages(); // pages of the snapshot (diagnostics) // RB_SNAP_NO_IDLE: learn only while no SPU job runs
 	// RB_SNAP_FOREIGN=2: pages first written by the network threads (or host writes), still saved and restored
 	std::vector<u32> state_foreign_pages();
 	// A memory map change by the game (sys_memory_allocate/free, sys_mmapper): kernel state that a snapshot does not

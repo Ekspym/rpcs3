@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include "Utilities/File.h"
 #include <mutex>
 #include <thread>
 
@@ -31,6 +32,35 @@ namespace
 	std::mutex g_lag_mutex;
 	std::condition_variable g_lag_cv;
 	std::deque<lagged_packet> g_lag_queue;
+
+	// tekken-rollback tests: RB_NET_DROP_FILE=<path>: while that file exists, every outgoing game P2P packet is dropped
+	// (a connection loss: the game ends the match with a communication error). Checked every 100 ms.
+	bool net_dropped()
+	{
+		static const std::string path = []() { const char* v = std::getenv("RB_NET_DROP_FILE"); return std::string(v ? v : ""); }();
+
+		if (path.empty())
+		{
+			return false;
+		}
+
+		static std::atomic<s64> next_check{0};
+		static std::atomic<bool> dropped{false};
+		const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+
+		if (now >= next_check)
+		{
+			next_check = now + 100;
+			const bool d = fs::is_file(path);
+
+			if (d != dropped.exchange(d))
+			{
+				sys_net.warning("RB_NET_DROP_FILE: outgoing P2P packets %s", d ? "dropped" : "sent again");
+			}
+		}
+
+		return dropped;
+	}
 
 	u32 lag_ms()
 	{
@@ -371,6 +401,11 @@ std::optional<s32> lv2_socket_p2p::sendto(s32 flags, const std::vector<u8>& buf,
 	if (flags & SYS_NET_MSG_WAITALL)
 	{
 		native_flags |= MSG_WAITALL;
+	}
+
+	if (net_dropped())
+	{
+		return {::size32(buf)};
 	}
 
 	if (lag_ms())

@@ -7,6 +7,9 @@
 #include "sysPrxForUser.h"
 
 #include "cellAdec.h"
+#include "Emu/Rollback/rb_state.h"
+#include <map>
+#include <mutex>
 
 #include "util/simd.hpp"
 #include "util/asm.hpp"
@@ -1481,6 +1484,9 @@ error_code cellAdecQueryAttr(ppu_thread& ppu, vm::ptr<CellAdecType> type, vm::pt
 	return CELL_OK;
 }
 
+static std::mutex rb_adec_ranges_mutex;
+static std::map<u32, std::pair<u32, u32>> rb_adec_ranges;
+
 error_code adecOpen(ppu_thread& ppu, vm::ptr<CellAdecType> type, vm::cptr<CellAdecResource> res, vm::cptr<CellAdecCb> cb, vm::pptr<AdecContext> handle, vm::cptr<CellAdecResourceSpurs> spursRes)
 {
 	if (!type || type->audioCodecType >= 32 || !res || !res->startAddr || res->ppuThreadPriority >= 0xa00 || res->spuThreadPriority >= 0x100 || res->ppuThreadStackSize < 0x1000 || !cb || !cb->cbFunc || !handle)
@@ -1561,6 +1567,16 @@ error_code adecOpen(ppu_thread& ppu, vm::ptr<CellAdecType> type, vm::cptr<CellAd
 
 	*handle = _this;
 
+	// Rollback fork: the decoder's whole work memory (AdecContext, core context, frame and PCM queues) is written by the
+	// decoder threads; restored by a rollback snapshot, a submitted AU was lost and libatrac waited forever for AUDONE (Tekken 6
+	// online: the sound core hung joining its decoder thread, all sound stopped). It stays out of the snapshots while open.
+	{
+		std::lock_guard lock(rb_adec_ranges_mutex);
+		rb_adec_ranges[_this.addr()] = {+res->startAddr, res->startAddr + res->totalMemSize};
+	}
+
+	rb::state_exclude_async(res->startAddr, res->startAddr + res->totalMemSize, "cellAdec instance");
+
 	const auto notifyAuDone = vm::ptr<AdecNotifyAuDone>::make(g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(adecNotifyAuDone)));
 	const auto notifyPcmOut = vm::ptr<AdecNotifyPcmOut>::make(g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(adecNotifyPcmOut)));
 	const auto notifyError = vm::ptr<AdecNotifyError>::make(g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(adecNotifyError)));
@@ -1624,6 +1640,16 @@ error_code cellAdecClose(ppu_thread& ppu, vm::ptr<AdecContext> handle)
 	if (error_code ret = handle->core_ops->close(ppu, handle->core_handle); ret != CELL_OK)
 	{
 		return ret;
+	}
+
+	{
+		std::lock_guard lock(rb_adec_ranges_mutex);
+
+		if (const auto it = rb_adec_ranges.find(handle.addr()); it != rb_adec_ranges.end())
+		{
+			rb::state_unexclude_async(it->second.first, it->second.second, "cellAdec instance closed");
+			rb_adec_ranges.erase(it);
+		}
 	}
 
 	if (error_code ret = lv2_syscall<sys_mutex_destroy>(ppu, handle->mutex); ret != CELL_OK)

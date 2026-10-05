@@ -4,12 +4,16 @@
 #include "rb_checksum.h"
 
 #include "Emu/Cell/PPUThread.h"
+#include "Emu/Cell/SPUThread.h"
 #include "Emu/Cell/PPUFunction.h"
 #include "Emu/Cell/PPUModule.h"
 #include "Emu/IdManager.h"
 #include "Emu/System.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/Cell/lv2/sys_timer.h"
+#include "Emu/Cell/lv2/sys_cond.h"
+#include "Emu/Cell/lv2/sys_mutex.h"
+#include "Emu/Cell/lv2/sys_ppu_thread.h"
 #include "Emu/system_config.h"
 #include "Utilities/File.h"
 #include "Utilities/StrUtil.h"
@@ -24,6 +28,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -51,6 +56,8 @@ extern bool ppu_form_branch_to_code(u32 entry, u32 target);
 //                        without rendering. Needs the snapshot ring (RB_SNAP_RING=1 with RB_SNAP_RANGES etc.).
 namespace rb::online
 {
+	static bool predict_game_mode();
+
 	namespace
 	{
 		constexpr u32 mgr_pointer = 0x00BCC400;
@@ -483,7 +490,7 @@ namespace rb::online
 			const bool resim = is_resimulating();
 
 			if (config().predict && mode == 1 && in_fight() && ring_ready() && !g_sim_at.empty() && player == remote_player(mgr) && sim > 0 &&
-				((resim && sim <= g_resim_sim_limit) || (sim < available + config().max_predict && !too_old && !g_sync_hold)) && (vm::read8(flag_addr(mgr, i, sim - 1)) & 1))
+				((resim && sim <= g_resim_sim_limit) || (sim < available + config().max_predict && !too_old && !g_sync_hold && predict_game_mode())) && (vm::read8(flag_addr(mgr, i, sim - 1)) & 1))
 			{
 				const entry_t prev = read_entry(slot_addr(mgr, i, sim - 1));
 				std::memcpy(vm::get_super_ptr<u8>(slot_addr(mgr, i, sim)), prev.data(), entry_size);
@@ -734,6 +741,34 @@ namespace rb::online
 		}
 	}
 
+	// Game mode (FUN_0020c754: *(*0x00967cf4 + 0xc); 1/3/4/5 round, 6 KO, 10 after the KO / replay). Changes are logged.
+	// RB_ONLINE_PREDICT_MODES (comma separated, default: every mode): prediction only in these modes, lockstep in the
+	// others, so a skipped intro or replay (a remote input every prediction misses) never needs a rollback across the
+	// scene change (user: crash when skipping the replay or the intro scenes)
+	static bool predict_game_mode()
+	{
+		const u32 base = vm::read32(0x00967cf4);
+		const u32 mode = base ? static_cast<u32>(vm::read32(base + 0xc)) : umax;
+
+
+		static const std::set<u32> modes = []()
+		{
+			std::set<u32> m;
+
+			if (const char* v = std::getenv("RB_ONLINE_PREDICT_MODES"); v && *v)
+			{
+				for (const auto& part : fmt::split(v, {","}))
+				{
+					m.insert(static_cast<u32>(std::atoi(part.c_str())));
+				}
+			}
+
+			return m;
+		}();
+
+		return modes.empty() || modes.count(mode);
+	}
+
 	// Copy of FUN_0021bb94(job) (wait for a SPURS job: pending +0x304, launched +0x308, FUN_0021bb00 = still running, then
 	// cellSpursEventFlagTryWait on job+0x200 every 100 us) with a time limit of 200 ms: a job pending in a restored state that
 	// finished in the discarded timeline (or never runs again) would be waited for forever (o134: stage particle job after
@@ -760,6 +795,33 @@ namespace rb::online
 		if (static std::set<u32> jobs; jobs.insert(job).second)
 		{
 			state_exclude(job + 0x200, job + 0x280, "SPURS job event flag");
+
+			// The SPURS instance of its job chain (CellSpurs, 0x2000 bytes, pointer at chain+0x78) is SPU scheduler state written
+			// by cellSpurs calls on the main thread: restored by a load, the workload states no longer matched the SPUs and the
+			// stage teardown hung in cellSpursJoinJobChain (r10, r12: black screen at the round end)
+			if (const u32 chain = vm::read32(job + 0x180); chain && !(chain & 0x7f) && vm::check_addr(chain + 0x7c, vm::page_readable))
+			{
+				if (const u32 spurs = vm::read32(chain + 0x7c); spurs && !(spurs & 0x7f))
+				{
+					if (static std::set<u32> instances; instances.insert(spurs).second)
+					{
+						// CellSpurs is 0x1000 bytes, CellSpurs2 (32 workloads, flags1 +0x74 bit 0x40) 0x2000
+						state_exclude(spurs, spurs + ((vm::read8(spurs + 0x74) & 0x40) ? 0x2000 : 0x1000), "SPURS instance");
+					}
+
+					// The job chain itself (CellSpursJobChain 0x110 bytes: pc, link registers, counters) is advanced by the SPUs:
+					// restored, its pc went back while the SPURS instance (live) did not, the chain got stuck (r18: job 0x00b80800
+					// "pending without completion" after every load from round 2 on, then the teardown did not shut it down).
+					// RB_SPURS_CHAIN_EXCLUDE=0 keeps it in the snapshots (s12 desynced with it excluded, but without the instance).
+					if (static const bool chain_ex = !std::getenv("RB_SPURS_CHAIN_EXCLUDE") || *std::getenv("RB_SPURS_CHAIN_EXCLUDE") != '0'; chain_ex)
+					{
+						if (static std::set<u32> chains; chains.insert(chain).second)
+						{
+							state_exclude(chain, chain + 0x110, "SPURS job chain");
+						}
+					}
+				}
+			}
 		}
 
 		const u32 old_r1 = static_cast<u32>(ppu.gpr[1]);
@@ -769,6 +831,21 @@ namespace rb::online
 
 		ppu.gpr[3] = job;
 		ppu.fast_call(0x0021bb00, toc);
+
+		// A job that timed out twice is not waited for again until its event bit shows it finished (r14: a stuck job cost
+		// 200 ms in every frame, ~5 fps for 80 s until the peer gave up with a communication error)
+		static std::map<u32, u32> stuck_waits;
+
+		if (static_cast<u32>(ppu.gpr[3]) == 0)
+		{
+			// Not running (finished): later launches of this job object are waited for normally again
+			stuck_waits.erase(job);
+		}
+		else if (stuck_waits[job] >= 2 && vm::read16(job + 0x200) == 0)
+		{
+			ppu.gpr[1] = old_r1;
+			return;
+		}
 
 		if (static_cast<u32>(ppu.gpr[3]) != 0)
 		{
@@ -784,11 +861,14 @@ namespace rb::online
 
 				if (static_cast<u32>(ppu.gpr[3]) == 0)
 				{
+					stuck_waits[job] = 0;
 					break;
 				}
 
 				if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(200))
 				{
+					stuck_waits[job]++;
+
 					if (static u32 logged = 0; logged++ < 50)
 					{
 						rb_online_log.warning("SPURS job 0x%08x did not finish within 200 ms (a job of a discarded timeline), wait cancelled", job);
@@ -799,6 +879,180 @@ namespace rb::online
 
 				sys_timer_usleep(ppu, 100);
 			}
+		}
+
+		ppu.gpr[1] = old_r1;
+	}
+
+	// Copy of FUN_0021bce8(job) (stage teardown of a SPURS job object: wait for the job, cellSpursShutdownJobChain,
+	// cellSpursJoinJobChain, detach the event flag, free the buffers) where the join only happens once the workload really
+	// shut down. A job chain whose state went through rollbacks did not shut down at times and the join (libsre, LLE) waited
+	// forever: black screen at the round end (r10, r12, r13). After 1 s the join is skipped (the workload slot stays
+	// occupied, the chain does not run any more).
+	void hle_spurs_job_teardown(ppu_thread& ppu, u32 job)
+	{
+		constexpr u64 toc = 0x0096A8B0;
+
+		hle_spurs_job_wait(ppu, job);
+
+		if (vm::read32(job + 0x14) == 0)
+		{
+			return;
+		}
+
+		const u32 old_r1 = static_cast<u32>(ppu.gpr[1]);
+		ppu.gpr[1] = (old_r1 - 0x100) & ~0xfu;
+		vm::write32(static_cast<u32>(ppu.gpr[1]), old_r1);
+
+		const auto call = [&](u32 addr, u32 r3, u32 r4 = 0)
+		{
+			ppu.gpr[3] = r3;
+			ppu.gpr[4] = r4;
+			ppu.fast_call(addr, toc);
+		};
+
+		const u32 chain = vm::read32(job + 0x180);
+		call(0x007519ac, chain); // cellSpursShutdownJobChain
+
+		bool removable = true;
+
+		if (chain && vm::check_addr(chain + 0x7c, vm::page_readable))
+		{
+			const u32 spurs = vm::read32(chain + 0x7c);
+			const u32 wid = vm::read32(chain + 0x74);
+
+			if (spurs && wid < 32 && vm::check_addr(spurs, vm::page_readable))
+			{
+				const u32 state_addr = spurs + (wid < 16 ? 0x80 : 0xD0) + (wid & 0xf);
+				const auto start = std::chrono::steady_clock::now();
+
+				// SPURS_WKL_STATE_SHUTTING_DOWN (3) until the SPUs left the workload, then REMOVABLE (4); joined only then
+				while (vm::read8(state_addr) != 4 && vm::read8(state_addr) != 0 && !ppu.is_stopped())
+				{
+					if (std::chrono::steady_clock::now() - start > std::chrono::seconds(1))
+					{
+						removable = false;
+						rb_online_log.error("SPURS job chain 0x%08x (job 0x%08x, workload %u) did not shut down within 1 s, not joined", chain, job, wid);
+						break;
+					}
+
+					sys_timer_usleep(ppu, 500);
+				}
+			}
+		}
+
+		if (removable)
+		{
+			call(0x00751b4c, chain); // cellSpursJoinJobChain
+		}
+
+		call(0x0075184c, job + 0x200); // cellSpursEventFlagDetachLv2EventQueue
+
+		for (const auto& [ptr, buf] : {std::pair{0x180u, 0x320u}, std::pair{0x184u, 0x330u}, std::pair{0x188u, 0x340u}, std::pair{0x308u, 0x350u}})
+		{
+			// Not shut down: the SPUs may still read the chain's buffers, they are leaked instead of freed
+			if (vm::read32(job + ptr) != 0 && removable)
+			{
+				call(0x00139748, job + buf, 0);
+			}
+
+			if (ptr != 0x308)
+			{
+				vm::write32(job + ptr, 0);
+			}
+		}
+
+		vm::write32(job + 0x14, 0);
+		vm::write32(job + 0x308, 0);
+		ppu.gpr[1] = old_r1;
+	}
+
+	// Copy of FUN_006b51dc(wrapper): destroys the ATRAC3plus decoder of a sound voice (FUN_006b4dc0: quit obj+0x218, signal
+	// the cond obj+0x220, join the thread obj+0x210, free obj+0x24c, destroy the cond and mutex obj+0x21c; then vtable[0](obj),
+	// FUN_006b2b40(obj)) with a bounded join. r18: a rolled back cellAdec state lost an AU-done, the decoder thread waited in
+	// cellAtracDecode forever and the join stopped bnusCoreUpdateThread (all sound silent). A thread that does not exit within
+	// 500 ms is left behind: object, mutex, cond and buffers leaked, its wrapper pointer goes to a private copy (the caller
+	// zeroes and reuses the wrapper).
+	void hle_at3p_decoder_destroy(ppu_thread& ppu, u32 wrapper)
+	{
+		constexpr u64 toc = 0x0096A8B0;
+		const u32 obj = vm::read32(wrapper + 0x10);
+
+		if (!obj)
+		{
+			return;
+		}
+
+		const u32 old_r1 = static_cast<u32>(ppu.gpr[1]);
+		ppu.gpr[1] = (old_r1 - 0x100) & ~0xfu;
+		vm::write32(static_cast<u32>(ppu.gpr[1]), old_r1);
+		const u32 sp = static_cast<u32>(ppu.gpr[1]);
+
+		const u32 tid = static_cast<u32>(vm::read64(obj + 0x210));
+		vm::write8(obj + 0x218, 1);
+		sys_cond_signal(ppu, vm::read32(obj + 0x220));
+
+		// Exited: a joinable thread after sys_ppu_thread_exit is a zombie until joined (or gone from IDM)
+		const auto exited = [&]()
+		{
+			const auto r = idm::check<named_thread<ppu_thread>>(tid, [](named_thread<ppu_thread>& t)
+			{
+				const ppu_join_status s = t.joiner.load();
+				return s == ppu_join_status::zombie || s == ppu_join_status::exited;
+			});
+
+			return !r || r.ret;
+		};
+
+		const auto start = std::chrono::steady_clock::now();
+		bool done = exited();
+
+		while (!done && !ppu.is_stopped() && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500))
+		{
+			sys_timer_usleep(ppu, 1000);
+			done = exited();
+		}
+
+		if (done)
+		{
+			// The original sequence (the join returns at once)
+			sys_ppu_thread_join(ppu, tid, vm::ptr<u64>::make(sp + 0x70));
+
+			if (const u32 buf = vm::read32(obj + 0x24c))
+			{
+				ppu.gpr[3] = buf;
+				ppu.fast_call(0x006b2b40, toc);
+			}
+
+			vm::write32(obj + 0x24c, 0);
+			sys_cond_destroy(ppu, vm::read32(obj + 0x220));
+			sys_mutex_destroy(ppu, vm::read32(obj + 0x21c));
+
+			const u32 opd = vm::read32(vm::read32(obj)); // vtable[0]
+			ppu.gpr[3] = obj;
+			ppu.fast_call(vm::read32(opd), vm::read32(opd + 4));
+			ppu.gpr[3] = obj;
+			ppu.fast_call(0x006b2b40, toc);
+		}
+		else
+		{
+			// One 64 KiB block for at most 256 wrapper copies (outside the snapshot ranges)
+			static u32 leaked = 0;
+			static u32 pool = 0;
+
+			if (!pool)
+			{
+				pool = vm::alloc(0x10000, vm::main);
+			}
+
+			if (const u32 copy = pool && leaked < 0x100 ? pool + leaked * 0x100 : 0)
+			{
+				std::memcpy(vm::base(copy), vm::base(wrapper), 0x100);
+				vm::write32(copy + 0x10, obj);
+				vm::write32(obj + 4, copy);
+			}
+
+			rb_online_log.error("AT3P decoder thread 0x%x (object 0x%08x) did not exit within 500 ms: left behind (%u so far)", tid, obj, ++leaked);
 		}
 
 		ppu.gpr[1] = old_r1;
@@ -1222,6 +1476,7 @@ namespace rb::online
 		u32 out, bank, cue, handle;
 		bool claimed;
 		bool cosmetic = false; // started by work left out of re-simulated frames (drawing, effects): never stopped
+		bool collected = false; // stopped by the leak cleanup
 	};
 
 	std::deque<sound_play_t> g_sound_plays;
@@ -1232,6 +1487,230 @@ namespace rb::online
 	{
 		static const bool on = !std::getenv("RB_ONLINE_SOUND_DEDUP") || *std::getenv("RB_ONLINE_SOUND_DEDUP") != '0';
 		return on;
+	}
+
+	// Sound diagnostics (every 600 live frames): starts, failed starts (by code), starts skipped as already playing, stops of
+	// discarded sounds, active voices of the library
+	u64 g_snd_ok = 0, g_snd_fail = 0, g_snd_claimed = 0, g_snd_stopped = 0;
+	std::map<s32, u64> g_snd_fail_codes;
+
+	// RB_SOUND_PAGES=1 (diagnostics): snapshot pages changed by the sound library (PLAY, the per-frame library update):
+	// its runtime state, which a rollback must not restore. Logged every 100 measured calls with change counts.
+	struct sound_page_probe
+	{
+		std::vector<std::pair<u32, u64>> before;
+		static inline std::map<u32, u32> changed;
+		static inline u32 calls = 0;
+
+		static bool on()
+		{
+			static const bool v = std::getenv("RB_SOUND_PAGES") && *std::getenv("RB_SOUND_PAGES") == '1';
+			return v && calls < 2000;
+		}
+
+		static u64 hash(u32 page)
+		{
+			const u8* p = vm::get_super_ptr<u8>(page);
+			u64 h = 0xcbf29ce484222325;
+
+			for (u32 i = 0; i < 0x1000; i += 8)
+			{
+				u64 w;
+				std::memcpy(&w, p + i, 8);
+				h = (h ^ w) * 0x100000001b3;
+			}
+
+			return h;
+		}
+
+		sound_page_probe()
+		{
+			if (!on())
+			{
+				return;
+			}
+
+			for (const u32 page : state_saved_pages())
+			{
+				if (vm::check_addr(page, vm::page_readable))
+				{
+					before.emplace_back(page, hash(page));
+				}
+			}
+		}
+
+		~sound_page_probe()
+		{
+			if (before.empty())
+			{
+				return;
+			}
+
+			for (const auto& [page, h] : before)
+			{
+				if (vm::check_addr(page, vm::page_readable) && hash(page) != h)
+				{
+					changed[page]++;
+				}
+			}
+
+			if (++calls % 100 == 0)
+			{
+				std::string text;
+				u32 begin = 0, end = 0, peak = 0;
+
+				for (const auto& [page, n] : changed)
+				{
+					if (page != end)
+					{
+						if (end)
+						{
+							fmt::append(text, " 0x%08x-0x%08x(%u)", begin, end, peak);
+						}
+
+						begin = page;
+						peak = 0;
+					}
+
+					end = page + 0x1000;
+					peak = std::max(peak, n);
+				}
+
+				if (end)
+				{
+					fmt::append(text, " 0x%08x-0x%08x(%u)", begin, end, peak);
+				}
+
+				rb_online_log.notice("Sound library pages in the snapshot (%u calls):%s", calls, text);
+			}
+		}
+	};
+
+	// Sound library state outside the rollback, learnt: during the first RB_SOUND_LEARN calls (default 300; 0 = off) of the
+	// sound start (PLAY) and of the per-frame library update in live fight frames, every byte of the game heap pages of
+	// the snapshot (0x36C00000-0x37600000) that the call changes is counted. Bytes changed in at least 5% of the calls
+	// (library counters, the game's voice table, the bank runtime data, the handles of the sound objects) are excluded from
+	// the snapshot: a rollback restored them while the library went on, the bank data got inconsistent and every start
+	// failed ("KeyOn Failed" 0x80000000: silence; the next match hung on the VS screen waiting for the announcer).
+	struct sound_learner
+	{
+		static inline std::map<u32, std::array<u16, 0x1000>> counts;
+		static inline u32 calls = 0;
+		static inline bool applied = false;
+		static inline bool active = false;
+		std::vector<std::pair<u32, std::array<u8, 0x1000>>> before;
+
+		static u32 target()
+		{
+			static const u32 v = std::getenv("RB_SOUND_LEARN") ? static_cast<u32>(std::atoi(std::getenv("RB_SOUND_LEARN"))) : 0u; // off by default: it also caught bytes of other threads (input manager)
+			return v;
+		}
+
+		void begin()
+		{
+			if (applied || active || !target() || !fight_active() || is_resimulating())
+			{
+				return;
+			}
+
+			active = true;
+
+			for (const u32 page : state_saved_pages())
+			{
+				if (page >= 0x36C00000 && page < 0x37600000 && vm::check_addr(page, vm::page_readable))
+				{
+					before.emplace_back(page, std::array<u8, 0x1000>{});
+					std::memcpy(before.back().second.data(), vm::get_super_ptr<u8>(page), 0x1000);
+				}
+			}
+		}
+
+		void end()
+		{
+			if (before.empty())
+			{
+				active = false;
+				return;
+			}
+
+			for (const auto& [page, data] : before)
+			{
+				const u8* now = vm::get_super_ptr<u8>(page);
+
+				if (vm::check_addr(page, vm::page_readable) && std::memcmp(now, data.data(), 0x1000) != 0)
+				{
+					auto& c = counts[page];
+
+					for (u32 b = 0; b < 0x1000; b++)
+					{
+						c[b] += now[b] != data[b];
+					}
+				}
+			}
+
+			before.clear();
+			active = false;
+
+			if (++calls >= target())
+			{
+				apply();
+			}
+		}
+
+		static void apply()
+		{
+			applied = true;
+			const u32 threshold = std::max<u32>(3, calls / 20);
+			u32 ranges = 0, bytes = 0;
+
+			for (const auto& [page, c] : counts)
+			{
+				for (u32 b = 0; b < 0x1000;)
+				{
+					if (c[b] < threshold)
+					{
+						b++;
+						continue;
+					}
+
+					u32 e = b + 1;
+
+					for (u32 last = b; e < 0x1000 && e - last <= 8; e++)
+					{
+						if (c[e] >= threshold)
+						{
+							last = e;
+						}
+					}
+
+					while (e > b + 1 && c[e - 1] < threshold)
+					{
+						e--;
+					}
+
+					const u32 rb = (page + b) & ~3u, re = (page + e + 3) & ~3u;
+					state_exclude(rb, re, "sound library state (learnt)");
+					ranges++;
+					bytes += re - rb;
+					b = e;
+				}
+			}
+
+			counts.clear();
+			rb_online_log.success("Sound library state learnt from %u calls: %u bytes in %u ranges excluded from the snapshot", calls, bytes, ranges);
+		}
+	};
+
+	sound_learner g_sound_learner;
+
+	void sound_learn_begin()
+	{
+		g_sound_learner.begin();
+	}
+
+	void sound_learn_end()
+	{
+		g_sound_learner.end();
 	}
 
 	s32 hle_sound_play(ppu_thread& ppu)
@@ -1258,10 +1737,20 @@ namespace rb::online
 						vm::write32(out, p.handle);
 					}
 
+					g_snd_claimed++;
 					return 0;
 				}
 			}
 		}
+
+		std::optional<sound_page_probe> probe;
+
+		if (!resim && sound_page_probe::on())
+		{
+			probe.emplace();
+		}
+
+		sound_learn_begin();
 
 		const u64 a3 = ppu.gpr[3], a4 = ppu.gpr[4], a5 = ppu.gpr[5], a8 = ppu.gpr[8], a9 = ppu.gpr[9], a10 = ppu.gpr[10];
 		const u32 sp = old_r1 - 0xb0;
@@ -1305,13 +1794,112 @@ namespace rb::online
 		}
 
 		ppu.gpr[1] = old_r1;
+		sound_learn_end();
+
+		if (ret == 0)
+		{
+			g_snd_ok++;
+		}
+		else
+		{
+			g_snd_fail++;
+			g_snd_fail_codes[ret]++;
+
+			// Where is the data of the failing sound: bank pointer (BM + bank * 0x2008 + 0x108), the bank info table
+			// (BM + 0x8030c) and whether the snapshot holds them (1 = saved/restored, 2 = excluded, 0 = not in the snapshot)
+			if (static u32 logged = 0; logged++ < 20)
+			{
+				const u32 smgr = vm::read32(vm::read32(0x0097078c));
+				const u32 bm = vm::read32(smgr + 0x1c38);
+				const u32 bank_ptr = vm::read32(bm + static_cast<u32>(a3) * 0x2008 + 0x108);
+				rb_online_log.warning("Sound start failed 0x%08x: bank %u cue %u, bank data 0x%08x (snapshot %d), bank infos 0x%08x (snapshot %d), game frame %u",
+					static_cast<u32>(ret), static_cast<u32>(a3), static_cast<u32>(a4), bank_ptr, state_addr_saved(bank_ptr), bm + 0x8030c,
+					state_addr_saved(bm + 0x8030c), seq[0]);
+
+				// bnusCore voice allocator (global 0x00D66D60: count +0x80, voices *(+0xc0) x 0x2f0, allocated +0xfc, failed
+				// allocations +0xf8; a voice is busy while +0x1a8 or +0x140 is set) and the nuSound2 voices holding a core
+				// voice (T = *(0x00D65ABC), 0xC0 x 0x48 at T + 0x24014, core voice id at +4, -1 = none)
+				constexpr u32 g = 0x00D66D60;
+				const u32 n = vm::read32(g + 0x80), core = vm::read32(g + 0xc0), t = vm::read32(0x00D65ABC);
+				u32 busy = 0, held = 0;
+
+				for (u32 i = 0; core && i < n && i < 0x400; i++)
+				{
+					busy += vm::read32(core + i * 0x2f0 + 0x1a8) != 0 || vm::read32(core + i * 0x2f0 + 0x140) != 0;
+				}
+
+				for (u32 i = 0; t && i < 0xC0; i++)
+				{
+					held += vm::read32(t + 0x24014 + i * 0x48 + 4) != umax;
+				}
+
+				rb_online_log.warning("Sound core: %u voices, %u busy, allocated counter %d, failed allocations %u, nuSound2 voices holding one %u (core 0x%08x saved %d, T 0x%08x saved %d)",
+					n, busy, static_cast<s32>(vm::read32(g + 0xfc)), +vm::read32(g + 0xf8), held, core, state_addr_saved(core), t, state_addr_saved(t + 0x24014));
+			}
+		}
 
 		if (ret == 0 && out && sound_dedup() && fight_active())
 		{
-			g_sound_plays.push_back({seq[0], out, bank, cue, vm::read32(out), resim, in_cosmetic_work()});
+			g_sound_plays.push_back({seq[0], out, bank, cue, vm::read32(out), resim, in_cosmetic_work(), false});
 		}
 
 		return ret;
+	}
+
+	// After a snapshot load: a sound started by drawing work (left out of re-simulated frames) keeps playing in the library
+	// (not rolled back), but the load reset its game object's handle field to "none" (-1): the object could not stop it and
+	// started it once more in the next live frame, looping sounds leaked a voice per rollback until all 192 were busy
+	// ("KeyOn Failed" 0x80000000, silence, the next match hung on the VS screen waiting for the announcer: r1/r2 tests).
+	// The handle of every such sound started since the restored frame is written back into its object.
+	void sound_after_load(u64 target)
+	{
+		if (!sound_dedup())
+		{
+			return;
+		}
+
+		u32 restored = 0;
+
+		for (const auto& p : g_sound_plays)
+		{
+			if (p.cosmetic && p.frame >= target && p.out && vm::check_addr(p.out, vm::page_readable | vm::page_writable) &&
+				vm::read32(p.out) == 0xffffffffu)
+			{
+				vm::write32(p.out, p.handle);
+				restored++;
+			}
+		}
+
+		if (static u64 total = 0; restored && (total += restored) % 50 < restored)
+		{
+			rb_online_log.notice("Sound handles of drawing work restored after loads: %u", total);
+		}
+	}
+
+	// Once per main loop frame: game mode changes (with the phase counter *(*0x00967cf4 + 0x24)) and, in the KO replay
+	// (mode 6, ends at counter 600 = 480 + 120 frames or when skipped), its progress every 60 frames
+	static void game_mode_frame()
+	{
+		const u32 base = vm::read32(0x00967cf4);
+
+		if (!base)
+		{
+			return;
+		}
+
+		const u32 mode = vm::read32(base + 0xc);
+		const u32 counter = vm::read32(base + 0x24);
+
+		if (static u32 last = 0xfffffffe; mode != last)
+		{
+			rb_online_log.notice("Game mode %u -> %u (counter %u, rollbacks %u, re-simulating %d)", last, mode, counter, g_rollbacks, is_resimulating());
+			last = mode;
+		}
+
+		if (static u64 frames = 0; mode == 6 && !is_resimulating() && ++frames % 60 == 0)
+		{
+			rb_online_log.notice("Replay: counter %u / 600, rollbacks %u", counter, g_rollbacks);
+		}
 	}
 
 	// Once per main loop frame: after a re-simulation, the unclaimed sounds of the discarded frames are stopped
@@ -1345,8 +1933,14 @@ namespace rb::online
 					ppu.gpr[3] = it->handle;
 					ppu.fast_call(0x0068dd38, 0x0096A8B0); // KeyOff(handle, 1)
 					ppu.gpr[1] = old_r1;
+					if (static u32 logged = 0; logged++ < 30)
+					{
+						rb_online_log.notice("Sound of a discarded frame stopped: frame %u, bank %u, cue %u, handle %u", it->frame, it->bank, it->cue, it->handle);
+					}
+
 					it = g_sound_plays.erase(it);
 					stopped++;
+					g_snd_stopped++;
 				}
 				else
 				{
@@ -1365,7 +1959,139 @@ namespace rb::online
 
 		g_sound_was_resim = resim;
 
-		while (!g_sound_plays.empty() && (g_sound_plays.front().frame + 600 < seq[0] || g_sound_plays.front().frame > seq[0] + 600))
+		if (static u64 frames = 0; !resim && ++frames % 600 == 0)
+		{
+			// Active voices: the library's voice table *(S+0x1c3c), 0xC0 entries of 0x168 bytes, each starting with its handle
+			u32 active = 0;
+			const u32 mgr_ptr = vm::read32(0x0097078c);
+			const u32 snd = mgr_ptr ? static_cast<u32>(vm::read32(mgr_ptr)) : 0u;
+			const u32 voices = snd && vm::check_addr(snd + 0x1c3c, vm::page_readable) ? static_cast<u32>(vm::read32(snd + 0x1c3c)) : 0u;
+
+			if (voices && vm::check_addr(voices, vm::page_readable, 0xC0 * 0x168))
+			{
+				for (u32 v = 0; v < 0xC0; v++)
+				{
+					active += vm::read32(voices + v * 0x168) != 0;
+				}
+			}
+
+			std::string codes;
+
+			for (const auto& [c, n] : g_snd_fail_codes)
+			{
+				fmt::append(codes, " 0x%08x:%u", static_cast<u32>(c), n);
+			}
+
+			rb_online_log.notice("Sound: %u started, %u failed (%s), %u kept from the first pass, %u discarded stopped, %u of 192 voices active, core updates %u",
+				g_snd_ok, g_snd_fail, codes, g_snd_claimed, g_snd_stopped, active, +vm::read32(0x00D66D60 + 0x90));
+
+			// The sound core update thread stopped (its counter did not move for 600 frames): where it waits, the SPU
+			// threads, and the mixer queues (first 0x80 bytes of *(0x00D66D60 + 0x3c / 0x44))
+			if (static u32 last_updates = 0, dumps = 0; vm::read32(0x00D66D60 + 0x90) == last_updates && last_updates && dumps < 3)
+			{
+				dumps++;
+				std::string out;
+
+				idm::select<named_thread<ppu_thread>>([&](u32 id, named_thread<ppu_thread>& t)
+				{
+					const auto name = t.ppu_tname.load();
+
+					if (name && (name->starts_with("bnus") || name->starts_with("CnuSound") || name->starts_with("HLE") || name->find("Spurs") != umax))
+					{
+						fmt::append(out, "\n  PPU 0x%x %s %s cia=0x%08x lr=0x%08x r3=0x%x%s", id, *name, (t.state & cpu_flag::wait) ? "WAIT" : "RUN ",
+							t.cia, static_cast<u32>(t.lr), t.gpr[3], name->starts_with("bnusCoreUpdate") ? "\n" + t.dump_callstack() : std::string());
+					}
+				});
+
+				idm::select<named_thread<spu_thread>>([&](u32 id, named_thread<spu_thread>& t)
+				{
+					fmt::append(out, "\n  SPU 0x%x %s pc=0x%05x state=0x%x", id, t.get_name(), t.pc, +t.state.load());
+				});
+
+				for (const u32 off : {0x3cu, 0x44u})
+				{
+					const u32 q = vm::read32(0x00D66D60 + off);
+					fmt::append(out, "\n  queue +0x%x 0x%08x:", off, q);
+
+					for (u32 o = 0; q && o < 0x80; o += 4)
+					{
+						fmt::append(out, " %08x", +vm::read32(q + o));
+					}
+				}
+
+				rb_online_log.error("Sound core update thread stopped at %u updates:%s", last_updates, out);
+			}
+			else
+			{
+				last_updates = vm::read32(0x00D66D60 + 0x90);
+			}
+
+			// Diagnostics of voices that are not released: state (+0x20) histogram, the oldest voices' first 0x40 bytes
+			if (active >= 24)
+			{
+				std::map<u32, u32> states;
+				std::vector<std::pair<u32, u32>> by_handle;
+
+				for (u32 v = 0; v < 0xC0; v++)
+				{
+					if (const u32 h = vm::read32(voices + v * 0x168))
+					{
+						states[vm::read32(voices + v * 0x168 + 0x20)]++;
+						by_handle.emplace_back(h, voices + v * 0x168);
+					}
+				}
+
+				std::sort(by_handle.begin(), by_handle.end());
+				std::string hist, dump;
+
+				for (const auto& [st, n] : states)
+				{
+					fmt::append(hist, " %u:%u", st, n);
+				}
+
+				for (usz i = 0; i < by_handle.size() && i < 3; i++)
+				{
+					fmt::append(dump, "\n  voice 0x%08x:", by_handle[i].second);
+
+					for (u32 o = 0; o < 0x40; o += 4)
+					{
+						fmt::append(dump, " %08x", +vm::read32(by_handle[i].second + o));
+					}
+				}
+
+				rb_online_log.notice("Sound voices: handle counter %u, states (+0x20)%s, oldest:%s", +vm::read32(snd + 4), hist, dump);
+			}
+		}
+
+		// Leak cleanup (live frames, every 30): a sound playing for 4 s or more whose game object was rolled back to "no sound"
+		// (handle -1) is a voice nobody can stop any more: stopped (not when the field was reused for something else). Short sounds end on their own before that.
+		if (!resim && seq[0] % 30 == 0)
+		{
+			u32 cleaned = 0;
+
+			for (auto& p : g_sound_plays)
+			{
+				if (!p.collected && p.frame + 240 <= seq[0] && p.out && vm::check_addr(p.out, vm::page_readable) && vm::read32(p.out) == 0xffffffffu)
+				{
+					p.collected = true;
+					auto& ppu = *get_current_cpu_thread<ppu_thread>();
+					const u32 old_r1 = static_cast<u32>(ppu.gpr[1]);
+					ppu.gpr[1] = (old_r1 - 0x100) & ~0xfu;
+					vm::write32(static_cast<u32>(ppu.gpr[1]), old_r1);
+					ppu.gpr[3] = p.handle;
+					ppu.fast_call(0x0068dd38, 0x0096A8B0); // KeyOff(handle, 1); nothing happens for a voice that ended
+					ppu.gpr[1] = old_r1;
+					cleaned++;
+				}
+			}
+
+			if (static u64 total = 0; cleaned && (total += cleaned) % 100 < cleaned)
+			{
+				rb_online_log.notice("Sounds without an owner stopped: %u", total);
+			}
+		}
+
+		while (!g_sound_plays.empty() && (g_sound_plays.front().frame + 1200 < seq[0] || g_sound_plays.front().frame > seq[0] + 1200))
 		{
 			g_sound_plays.pop_front();
 		}
@@ -1536,6 +2262,8 @@ namespace rb::online
 	const u32 s_voice_stop_index = REG_HIDDEN_FUNC(hle_voice_stop_wait);
 	const u32 s_sound_play_index = REG_HIDDEN_FUNC(hle_sound_play);
 	const u32 s_spurs_job_wait_index = REG_HIDDEN_FUNC(hle_spurs_job_wait);
+	const u32 s_spurs_job_teardown_index = REG_HIDDEN_FUNC(hle_spurs_job_teardown);
+	const u32 s_at3p_decoder_destroy_index = REG_HIDDEN_FUNC(hle_at3p_decoder_destroy);
 	const u32 s_get_input_index = REG_HIDDEN_FUNC(hle_get_input);
 	const u32 s_available_index = REG_HIDDEN_FUNC(hle_input_available);
 	const u32 s_store_input_index = REG_HIDDEN_FUNC(hle_store_input);
@@ -1582,7 +2310,7 @@ namespace rb::online
 
 		for (const auto& [addr, index] : {std::pair{0x004073f4u, s_get_input_index}, std::pair{0x00407fd4u, s_store_input_index},
 			std::pair{0x00407054u, s_available_index}, std::pair{0x0069afa0u, s_voice_stop_index}, std::pair{0x0069effcu, s_sound_bank_lookup_index}, std::pair{0x0068e108u, s_sound_play_index}, std::pair{0x0021bb94u, s_spurs_job_wait_index},
-			std::pair{0x0042371cu, s_input_message_read_index}, std::pair{0x005bb268u, s_shader_param_set_index}, std::pair{0x005bb0e8u, s_shader_param_set_b_index}})
+			std::pair{0x0021bce8u, s_spurs_job_teardown_index}, std::pair{0x006b51dcu, s_at3p_decoder_destroy_index}, std::pair{0x0042371cu, s_input_message_read_index}, std::pair{0x005bb268u, s_shader_param_set_index}, std::pair{0x005bb0e8u, s_shader_param_set_b_index}})
 		{
 			const u32 target = g_fxo->get<ppu_function_manager>().func_addr(index, true);
 
@@ -2066,6 +2794,7 @@ namespace rb::online
 				vm::write32(mgr + 0x58 + li * 4, std::max<u32>(vm::read32(mgr + 0x58 + li * 4), local->available));
 				vm::write32(mgr + 0x68 + li * 4, std::max<u32>(vm::read32(mgr + 0x68 + li * 4), local->sent));
 				reapply_remote(mgr, vm::read32(mgr + 0x60 + ri * 4));
+				sound_after_load(target);
 				g_rollbacks++;
 				g_sim_at.erase(g_sim_at.upper_bound(target), g_sim_at.end());
 
@@ -2176,6 +2905,7 @@ namespace rb::online
 		const config_t& cfg = config();
 		const u32 mgr = manager();
 
+		game_mode_frame();
 		sound_frame();
 		g_fight_frames = mgr && fight_markers() ? g_fight_frames + 1 : 0;
 
@@ -2186,7 +2916,7 @@ namespace rb::online
 			get_seq(sq);
 			g_sync_hold = false;
 
-			if (target > 0 && mgr && in_fight() && !state_resimulating(sq[0]))
+			if (target > 0 && mgr && in_fight() && predict_game_mode() && !state_resimulating(sq[0]))
 			{
 				const u32 r = remote_player(mgr) - 1;
 				const u32 rsim = vm::read32(mgr + 0x60 + r * 4);
@@ -2298,7 +3028,7 @@ namespace rb::online
 			static u32 stall_frames = 0;
 			stall_frames = sim_now == stall_sim ? stall_frames + 1 : 0;
 
-			if (cfg.lead == -2 && !is_resimulating() && cfg.predict && in_fight() && ring_ready())
+			if (cfg.lead == -2 && !is_resimulating() && cfg.predict && in_fight() && predict_game_mode() && ring_ready())
 			{
 				// Deficit of a frame = (local sim + 1) - remote available: the game waits when it exceeds the prediction
 				// window, every frame of input delay lowers it by one (ANALYZA.md 38). Raised at once by the 90th
@@ -2757,7 +3487,122 @@ namespace rb::online
 
 			if (vm::check_addr(sound_manager, vm::page_readable) && std::getenv("RB_ONLINE_SOUND_ROLLBACK") == nullptr)
 			{
-				state_exclude(sound_manager + 0x24014, sound_manager + 0x24014 + 0xC0 * 0x48, "sound manager voice table");
+				// The whole nuSound2 library state stays out of the rollback (the user: sound must not be rolled back): the
+				// manager S (handle counter +4, bank manager +0x1c38, voice table +0x1c3c, voices +0x24014: 0x28000 bytes), the
+				// bank manager (bank infos at +0x8030c) and the voice table (0xC0 x 0x168). Restoring them while the sound
+				// thread used them corrupted the bank infos: "KeyOn Failed" (0x80000000) for more and more sounds, the sound
+				// went silent even in the lobby (r1 test).
+				state_exclude(sound_manager, sound_manager + 0x28000, "sound library manager");
+				const u32 banks = vm::read32(sound_manager + 0x1c38);
+				const u32 voices = vm::read32(sound_manager + 0x1c3c);
+
+				if (banks && vm::check_addr(banks, vm::page_readable))
+				{
+					state_exclude(banks, banks + 0x81000, "sound library bank manager");
+				}
+
+				if (voices && vm::check_addr(voices, vm::page_readable))
+				{
+					state_exclude(voices, voices + 0xC0 * 0x168, "sound library voice table");
+				}
+
+				rb_online_log.success("Sound library outside the rollback: manager 0x%08x, banks 0x%08x, voices 0x%08x", sound_manager, banks, voices);
+			}
+		}
+
+		// The lower layers of the sound library, written by KeyOn on the main thread (so their pages were saved and restored)
+		// and advanced by the sound threads: restored, a voice stayed "playing" forever (KeyOff waits timed out, voices were
+		// never freed, 0x1f voices per cue -> "KeyOn Failed" 0x80000000, silence, the VS screen waited for the announcer: r14).
+		// - nuSound2 voice states: T = *(0x00D65AB8 + 4), 0xC0 x 0x48 bytes at T + 0x24014 (FUN_0069e568), queue at T + 0x24010
+		// - bnusCore (global 0x00D66D60, not in the snapshot): voices *(+0xc0), *(+0x80) x 0x2f0 bytes; list *(+0xd8), *(+0xd0) x 4
+		// The sound mixer runs on an SPU: bnusCoreUpdateThread (FUN_006b3d2c, arg 0x00D66D60) pushes "STAT" to the SPURS
+		// queue *(+0x3c) and waits on the queue *(+0x44) for "END ". Restoring the queues (CellSyncLFQueue, 0x80 bytes, buffer
+		// *(+0x1c) of size +0x10 x depth +0x14) or their taskset (m_eaSignal +0x74, CellSpursTaskset 0x1900 bytes) from a
+		// snapshot left the update thread waiting forever: all sound went silent shortly after the first rollbacks (s20).
+		if (std::getenv("RB_ONLINE_SOUND_ROLLBACK") == nullptr)
+		{
+			static std::set<u32> done;
+			constexpr u32 core_thread_arg = 0x00D66D60;
+
+			// The queues (+0x3c push, +0x44 pop) and the other SPURS objects of the mixer (+0x30..+0x48) were allocated in one
+			// block next to the core voice list (*(+0xd8), *(+0xd0) x 4), e.g. 0x373fedc0..0x373ffa8c (s22): the whole block
+			// stays out of the snapshots (the layout of the LLE queue objects did not match CellSyncLFQueue, s21)
+			u32 lo = umax, hi = 0;
+
+			for (u32 off = 0x30; off <= 0x48; off += 4)
+			{
+				const u32 ptr = vm::read32(core_thread_arg + off);
+
+				const u32 anchor = vm::read32(core_thread_arg + 0x44);
+
+				if (ptr >= 0x10000000 && !(ptr & 0xf) && ptr + 0x4000 > anchor && ptr < anchor + 0x4000 && vm::check_addr(ptr, vm::page_readable))
+				{
+					lo = std::min(lo, ptr & ~0x7fu);
+					hi = std::max(hi, ptr + 0x180);
+				}
+			}
+
+			const u32 list = vm::read32(core_thread_arg + 0xd8);
+			const u32 list_n = vm::read32(core_thread_arg + 0xd0);
+
+			if (list && list_n <= 0x1000 && list >= lo && list < hi + 0x1000)
+			{
+				hi = std::max(hi, list + list_n * 4);
+			}
+
+			// The mixer's SPURS taskset (the queues' signal pointer, +0x64 in the LLE queue layout, e.g. 0x36fa4a80): restored,
+			// the mixer task was never woken again (s24: all SPURS kernels idle, the update thread waiting for "END ")
+			if (const u32 q = vm::read32(core_thread_arg + 0x44); q && vm::check_addr(q + 0x64, vm::page_readable))
+			{
+				const u32 taskset = vm::read32(q + 0x64);
+
+				if (taskset && !(taskset & 0x7f) && vm::check_addr(taskset, vm::page_readable) && done.insert(taskset).second)
+				{
+					state_exclude(taskset, taskset + 0x1900, "sound mixer SPURS taskset");
+					rb_online_log.success("Sound mixer SPURS taskset outside the rollback: 0x%08x (saved %d)", taskset, state_addr_saved(taskset));
+				}
+			}
+
+			if (lo < hi && hi - lo <= 0x8000 && done.insert(lo).second)
+			{
+				state_exclude(lo, hi, "sound mixer SPURS objects");
+				rb_online_log.success("Sound mixer SPURS objects outside the rollback: 0x%08x-0x%08x (saved %d)", lo, hi, state_addr_saved(vm::read32(core_thread_arg + 0x44)));
+			}
+		}
+
+		// RB_SOUND_EXCL_LOWER=1 (r16: with both excluded, sounds failed already in the fight; under investigation)
+		if (std::getenv("RB_ONLINE_SOUND_ROLLBACK") == nullptr && std::getenv("RB_SOUND_EXCL_LOWER") && *std::getenv("RB_SOUND_EXCL_LOWER") == '1')
+		{
+			static u32 last_t = 0, last_core = 0;
+			const u32 t = vm::read32(0x00D65ABC);
+			constexpr u32 g = 0x00D66D60;
+			const u32 core = vm::read32(g + 0xc0);
+
+			if (t && t != last_t && vm::check_addr(t, vm::page_readable))
+			{
+				last_t = t;
+				state_exclude(t, t + 0x24014 + 0xC0 * 0x48, "sound library voice states");
+				rb_online_log.success("Sound voice states outside the rollback: 0x%08x", t);
+			}
+
+			if (core && core != last_core && vm::check_addr(core, vm::page_readable))
+			{
+				last_core = core;
+				const u32 n = vm::read32(g + 0x80);
+				const u32 list = vm::read32(g + 0xd8);
+				const u32 list_n = vm::read32(g + 0xd0);
+
+				if (n && n <= 0x400)
+				{
+					state_exclude(core, core + n * 0x2f0, "sound core voices");
+				}
+
+				if (list && list_n && list_n <= 0x1000 && vm::check_addr(list, vm::page_readable))
+				{
+					state_exclude(list, list + list_n * 4, "sound core voice list");
+				}
+
+				rb_online_log.success("Sound core outside the rollback: %u voices at 0x%08x, list 0x%08x (%u)", n, core, list, list_n);
 			}
 		}
 

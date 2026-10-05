@@ -2,6 +2,7 @@
 #include "rb_state.h"
 
 #include "rb_input.h"
+#include "Emu/Memory/vm_locking.h"
 #include "Emu/CPU/CPUThread.h"
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/lv2/sys_timer.h"
@@ -90,6 +91,10 @@ namespace rb
 		// RB_SNAP_FOREIGN=2: the pages are only reported (state_foreign_pages), they stay in the snapshot; the online module
 		// keeps the bytes the other threads write live across a load
 		bool g_foreign_track_only = false;
+		// RB_SNAP_FOREIGN=3: only pages first written by the named threads (RB_SNAP_FOREIGN_THREADS) are excluded, not host
+		// writes or unnamed threads (SPU job results are game state): e.g. the file loader threads, whose data (sound banks
+		// of the round, loaded while the fight runs) a rollback restored to the content before the load
+		bool g_foreign_named_only = false;
 		std::vector<u32> g_foreign_tracked;
 
 		void mark_foreign(u32 page, const std::string& writer)
@@ -319,10 +324,11 @@ namespace rb
 			{
 				g_track = std::make_unique<std::atomic<u8>[]>(1u << 20);
 
-				if (const char* f = std::getenv("RB_SNAP_FOREIGN"); f && (*f == '1' || *f == '2'))
+				if (const char* f = std::getenv("RB_SNAP_FOREIGN"); f && (*f == '1' || *f == '2' || *f == '3'))
 				{
 					g_foreign = std::make_unique<std::atomic<u8>[]>(1u << 20);
 					g_foreign_track_only = *f == '2';
+					g_foreign_named_only = *f == '3';
 				}
 				g_track_enabled = true;
 				rb_log.success("Snapshot: write tracking of calibrated pages");
@@ -875,7 +881,7 @@ namespace rb
 						}
 
 						// (not in the tracking-only mode: these are mostly SPU job results, game state)
-						if (!g_foreign_track_only)
+						if (!g_foreign_track_only && !g_foreign_named_only)
 						{
 							mark_foreign(addr >> 12, "a host write (missed by the tracking)");
 						}
@@ -1220,6 +1226,17 @@ namespace rb
 		template <bool Save>
 		void copy(u32 slot)
 		{
+			// No page may be unmapped while the copy threads use it (r7: the file loader thread freed a heap page between the
+			// check below and the copy, the copy threads crashed reading it); vm::dealloc takes the same lock
+			// (the lock requires the caller's cpu_flag::wait, as for any thread that may block on it)
+			struct wait_flag
+			{
+				cpu_thread* cpu = cpu_thread::get_current();
+				wait_flag() { if (cpu) cpu->state += cpu_flag::wait; }
+				~wait_flag() { if (cpu) { cpu->state -= cpu_flag::wait; cpu->check_state(); } }
+			} wait;
+			vm::writer_lock vm_lock;
+
 			update_sync_exclusions();
 			refresh();
 			g_pieces.clear();
@@ -1432,8 +1449,65 @@ namespace rb
 	}
 
 	// Main thread: drops every snapshot when the memory map changed since the last check
+	namespace
+	{
+		struct async_exclusion
+		{
+			u32 begin, end;
+			const char* what;
+			bool add;
+		};
+
+		std::mutex g_async_mutex;
+		std::vector<async_exclusion> g_async_exclusions;
+
+		// Main thread, at a save or load boundary
+		void apply_async_exclusions()
+		{
+			std::vector<async_exclusion> list;
+
+			{
+				std::lock_guard lock(g_async_mutex);
+
+				if (g_async_exclusions.empty())
+				{
+					return;
+				}
+
+				list.swap(g_async_exclusions);
+			}
+
+			for (const auto& e : list)
+			{
+				if (e.add)
+				{
+					state_exclude(e.begin, e.end, e.what);
+				}
+				else if (std::erase_if(g_excluded, [&](const range_t& r) { return r.begin == e.begin && r.end == e.end; }))
+				{
+					g_layout_gen++;
+					rb_log.success("Snapshot includes 0x%08x-0x%08x again (%s)", e.begin, e.end, e.what);
+				}
+			}
+		}
+	}
+
+	void state_exclude_async(u32 begin, u32 end, const char* what)
+	{
+		std::lock_guard lock(g_async_mutex);
+		g_async_exclusions.push_back({begin, end, what, true});
+	}
+
+	void state_unexclude_async(u32 begin, u32 end, const char* what)
+	{
+		std::lock_guard lock(g_async_mutex);
+		g_async_exclusions.push_back({begin, end, what, false});
+	}
+
 	static void check_kernel_changes()
 	{
+		apply_async_exclusions();
+
 		if (const u32 n = g_kernel_changes.load(); n != g_kernel_changes_seen)
 		{
 			g_kernel_changes_seen = n;
@@ -1476,11 +1550,11 @@ namespace rb
 				return fmt::split(v && *v ? v : "net_", {","});
 			}();
 
-			if (!cpu && !g_foreign_track_only)
+			if (!cpu && !g_foreign_track_only && !g_foreign_named_only)
 			{
 				mark_foreign(page, std::string(thread_ctrl::get_name()));
 			}
-			else if (cpu->get_class() == thread_class::ppu && cpu->id != 0x1000000)
+			else if (cpu && cpu->get_class() == thread_class::ppu && cpu->id != 0x1000000)
 			{
 				const auto name = static_cast<ppu_thread*>(cpu)->ppu_tname.load();
 
@@ -1545,6 +1619,19 @@ namespace rb
 	bool state_resimulating(u64 game_frame)
 	{
 		return g_net_resim || (g_rollbacks && game_frame < g_last_rollback_from);
+	}
+
+	std::vector<u32> state_saved_pages()
+	{
+		std::vector<u32> out;
+		out.reserve(g_store.units.size());
+
+		for (const page_unit& u : g_store.units)
+		{
+			out.push_back(u.page);
+		}
+
+		return out;
 	}
 
 	void state_set_spu_busy_check(std::function<bool()> check)

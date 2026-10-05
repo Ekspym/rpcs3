@@ -1032,9 +1032,21 @@ namespace rb
 					cosmetic.emplace(ppu);
 				}
 
+				const bool sound_device = method == 0x00910798u && !resim;
+
+				if (sound_device)
+				{
+					online::sound_learn_begin();
+				}
+
 				ppu.gpr[3] = cur;
 				ppu.gpr[4] = 1;
 				ppu.fast_call(tekken_task_step, tekken_toc);
+
+				if (sound_device)
+				{
+					online::sound_learn_end();
+				}
 			}
 
 			node = static_cast<u32>(ppu.gpr[3]);
@@ -1849,9 +1861,22 @@ namespace rb
 					cosmetic.emplace(ppu);
 				}
 
+				// The sound device task updates the sound library every frame: learnt as library state (rb_online)
+				const bool sound_device = task_vtable == 0x00910798u && !resim;
+
+				if (sound_device)
+				{
+					online::sound_learn_begin();
+				}
+
 				ppu.gpr[3] = node;
 				ppu.gpr[4] = 1;
 				ppu.fast_call(tekken_task_step, tekken_toc);
+
+				if (sound_device)
+				{
+					online::sound_learn_end();
+				}
 			}
 
 			const u32 next_node = static_cast<u32>(ppu.gpr[3]);
