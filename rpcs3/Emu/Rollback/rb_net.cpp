@@ -8,7 +8,7 @@
 // GGPO (local fork in tekken-rollback/ggpo, branch tekken-rollback: MAX_PREDICTION_FRAMES 3, 56 byte inputs),
 // built as a static library with the static CRT (ggpo/build_rb)
 #include "../../../../ggpo/src/include/ggponet.h"
-#pragma comment(lib, "C:/t6r/ggpo/build_clean/lib/x64/Release/GGPO.lib")
+#pragma comment(lib, "GGPO.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winmm.lib")
 

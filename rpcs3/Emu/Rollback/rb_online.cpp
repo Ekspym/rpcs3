@@ -2785,7 +2785,7 @@ namespace rb::online
 	// tools\missing_state.py). RB_ONLINE_RESIM_DUMP_PREFIX, default records\resim_dump
 	static const u32 resim_dumps = std::getenv("RB_ONLINE_RESIM_DUMP") ? std::atoi(std::getenv("RB_ONLINE_RESIM_DUMP")) : 0;
 	static const std::string resim_dump_prefix = std::getenv("RB_ONLINE_RESIM_DUMP_PREFIX") ? std::getenv("RB_ONLINE_RESIM_DUMP_PREFIX") :
-		"C:\\t6r\\records\\resim_dump";
+		"records/resim_dump";
 	static u32 resim_dumped = 0;
 	static u64 resim_dump_frame = umax;
 
