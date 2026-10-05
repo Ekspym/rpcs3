@@ -731,6 +731,18 @@ namespace rb
 				g_wait_us_idle_total = g_wait_us_idle_max = 0;
 			}
 
+			if (g_rollbacks && g_last_rollback_from && state_resimulating(game_frame()))
+			{
+				static u64 rn = 0, rtotal = 0;
+				rtotal += us;
+
+				if (++rn % 600 == 0)
+				{
+					rb_log.notice("Draw thread idle wait in re-simulated frames: avg %u us (600 waits)", rtotal / 600);
+					rtotal = 0;
+				}
+			}
+
 			if (*vm::get_super_ptr<u64>(addr) != 0u)
 			{
 				rb_log.error("Draw idle wait timed out (0x%08x = %u)", addr, +*vm::get_super_ptr<u64>(addr));
@@ -1913,7 +1925,8 @@ namespace rb
 
 			// Pages that start changing later in the fight are added to the snapshot; older snapshots are
 			// completed with their calibration-start content (remap_snapshot)
-			if (g_cal_continuous && g_cal_done && !fast_rollback)
+			// (not at the boundaries of a re-simulation: the next live boundary finds the new pages; the write tracking keeps them)
+			if (g_cal_continuous && g_cal_done && !fast_rollback && !state_resimulating(game_frame))
 			{
 				if (const usz added = calibrate_step())
 				{

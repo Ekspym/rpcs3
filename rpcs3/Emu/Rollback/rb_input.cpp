@@ -677,7 +677,17 @@ namespace rb
 			}
 		}
 
-		if (state_resimulating(g_boundary_frame) || skip_draw)
+		// RB_RESIM_DISCARD (default on, 0 = off): a re-simulated frame's draw requests are discarded (FUN_005c10b4: reset of
+		// the frame allocator, nothing handed to the draw thread) instead of swapped (FUN_005c110c -> FUN_005c4e68), so the
+		// draw thread gets no work and the next boundary does not wait for it (o146: ~3 ms per re-simulated frame)
+		static const bool discard = get_env("RB_RESIM_DISCARD") != "0";
+
+		if (state_resimulating(g_boundary_frame) && discard)
+		{
+			ppu.gpr[3] = 0x00C89800; // NU::Draw::RequestManager
+			ppu.fast_call(0x005c10b4, tekken_toc);
+		}
+		else if (state_resimulating(g_boundary_frame) || skip_draw)
 		{
 			ppu.gpr[3] = 0x00C89800; // NU::Draw::RequestManager
 			ppu.fast_call(0x005c110c, tekken_toc);
@@ -1660,6 +1670,7 @@ namespace rb
 		depth++;
 		const auto t_start = std::chrono::steady_clock::now();
 		frame_boundary();
+		const auto t_state = std::chrono::steady_clock::now();
 		online::on_frame(ppu, root);
 		const auto t_boundary = std::chrono::steady_clock::now();
 
@@ -1699,6 +1710,25 @@ namespace rb
 		if (g_state.synced && !state_resimulating(g_state.seq[0]))
 		{
 			online::end_of_frame(ppu);
+		}
+
+		// Re-simulated frame budget: boundary (load / saves, online bookkeeping) vs. the frame's tasks
+		if (g_state.synced && state_resimulating(g_state.seq[0]))
+		{
+			static u64 n = 0, b_total = 0, w_total = 0, st_total = 0, st_max = 0;
+			const auto now = std::chrono::steady_clock::now();
+			const u64 st = std::chrono::duration_cast<std::chrono::microseconds>(t_state - t_start).count();
+			b_total += std::chrono::duration_cast<std::chrono::microseconds>(t_boundary - t_start).count();
+			w_total += std::chrono::duration_cast<std::chrono::microseconds>(now - t_boundary).count();
+			st_total += st;
+			st_max = std::max(st_max, st);
+
+			if (++n % 1000 == 0)
+			{
+				rb_log.notice("Re-simulated frame parts: boundary avg %u us (snapshot module %u us, max %u us; online %u us), tasks avg %u us (1000 frames)",
+					b_total / 1000, st_total / 1000, st_max, (b_total - st_total) / 1000, w_total / 1000);
+				b_total = w_total = st_total = st_max = 0;
+			}
 		}
 
 		// Live frame budget: boundary (snapshot save, online bookkeeping) vs. the frame's tasks (incl. the frame end wait)
