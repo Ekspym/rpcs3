@@ -779,11 +779,11 @@ namespace rb::online
 					break;
 				}
 
-				if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(30))
+				if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(200))
 				{
 					if (static u32 logged = 0; logged++ < 50)
 					{
-						rb_online_log.warning("SPURS job 0x%08x did not finish within 30 ms (a job of a discarded timeline), wait cancelled", job);
+						rb_online_log.warning("SPURS job 0x%08x did not finish within 200 ms (a job of a discarded timeline), wait cancelled", job);
 					}
 
 					break;
