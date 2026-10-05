@@ -48,6 +48,9 @@ namespace rb
 	// rolled back) even with RB_SNAP_FOREIGN=3; PPU writes there stay game state. Used next to an open cellAdec instance
 	// (the game's AT3P stream ring buffer). add = false removes the window.
 	void state_foreign_window(u32 begin, u32 end, bool add);
+	// Main thread, between frames: [begin, end) is excluded from the snapshot and its whole pages from the write tracking
+	// (add = false: back in the snapshot with the current content). RB_FILM_UNDO: the film data buffer.
+	void state_untracked_range(u32 begin, u32 end, bool add, const char* what);
 	void state_set_spu_busy_check(std::function<bool()> check);
 	std::vector<u32> state_saved_pages(); // pages of the snapshot (diagnostics) // RB_SNAP_NO_IDLE: learn only while no SPU job runs
 	// RB_SNAP_FOREIGN=2: pages first written by the network threads (or host writes), still saved and restored

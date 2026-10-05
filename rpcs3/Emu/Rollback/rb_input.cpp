@@ -1179,6 +1179,186 @@ namespace rb
 		}
 	}
 
+	// RB_FILM_UNDO=1: the film data ring (the match recording, ~9.7 MB, ~31 KiB per frame written linearly) stays out of the
+	// snapshot and the write tracking (it cost a write fault, an add to all slots and a cooling cycle for ~8 pages every frame).
+	// The ring object, frame headers and the film block stay in the snapshot, so a load returns the write offset and headers;
+	// the re-simulation records the frames again from there. What the discarded frames wrote is undone from an undo log:
+	// at every boundary (live and re-simulated, after a possible load) the bytes the frame may write, [wp, wp + window) with
+	// the wrap, are copied; a load to frame S writes the entries of frames >= S back, newest first.
+	// Ring (ghidra/film_ring.c): +0x2c data, +0x30 write offset (16 aligned; FUN_0029d100 restarts at 0 when a record does
+	// not fit), +0x34 data size.
+	struct film_undo_entry
+	{
+		u64 frame;
+		u32 wp;
+		u32 window;
+		std::vector<u8> head; // [wp, min(wp + window, size))
+		std::vector<u8> wrap; // [0, window) when wp + window > size
+	};
+
+	std::deque<film_undo_entry> g_film_undo;
+	u32 g_film_data = 0, g_film_size = 0;
+	u32 g_film_window = 0x10000;
+	bool g_film_undo_broken = false; // a frame wrote more than the window: older entries cannot restore it
+
+	bool film_undo_on()
+	{
+		static const bool on = get_env("RB_FILM_UNDO") == "1";
+		return on;
+	}
+
+	u32 film_ring()
+	{
+		const u32 block = vm::read32(0x00969744);
+
+		if (!block || !vm::check_addr(block, vm::page_readable, 8))
+		{
+			return 0;
+		}
+
+		const u32 film = vm::read32(block + 4);
+
+		if (!film || !vm::check_addr(film, vm::page_readable, 4))
+		{
+			return 0;
+		}
+
+		const u32 ring = vm::read32(film);
+		return ring && vm::check_addr(ring, vm::page_readable, 0x40) ? ring : 0;
+	}
+
+	// Main thread, every boundary after the snapshot module (load / save) of the frame that is about to run
+	void film_undo_boundary(u64 frame)
+	{
+		if (!film_undo_on())
+		{
+			return;
+		}
+
+		const u32 ring = film_ring();
+		const u32 data = ring ? static_cast<u32>(vm::read32(ring + 0x2c)) : 0;
+		const u32 size = ring ? static_cast<u32>(vm::read32(ring + 0x34)) : 0;
+		const bool valid = data && size && size < 0x2000000 && vm::check_addr(data, vm::page_readable | vm::page_writable, size);
+
+		// The buffer follows the film (a new match allocates a new one)
+		if (!valid || data != g_film_data || size != g_film_size)
+		{
+			if (g_film_data)
+			{
+				state_untracked_range(g_film_data, g_film_data + g_film_size, false, "film data");
+			}
+
+			g_film_undo.clear();
+			g_film_undo_broken = false;
+			g_film_data = valid ? data : 0;
+			g_film_size = valid ? size : 0;
+
+			if (!valid)
+			{
+				return;
+			}
+
+			state_untracked_range(data, data + size, true, "film data");
+			rb_log.success("Film undo: data 0x%08x+0x%x out of the snapshot (ring 0x%08x)", data, size, ring);
+		}
+
+		const u32 wp = vm::read32(ring + 0x30);
+
+		if (wp >= size)
+		{
+			return;
+		}
+
+		// Bytes written by the previous frame (with the wrap); the window grows with what frames really write
+		if (!g_film_undo.empty() && g_film_undo.back().frame + 1 == frame)
+		{
+			const film_undo_entry& prev = g_film_undo.back();
+			const u32 written = wp >= prev.wp ? wp - prev.wp : (size - prev.wp) + wp;
+
+			if (written > prev.window)
+			{
+				if (static u32 logged = 0; logged++ < 20)
+				{
+					rb_log.error("Film undo: frame %u wrote 0x%x bytes, more than the window 0x%x (a rollback over it cannot restore the film exactly)",
+						prev.frame, written, prev.window);
+				}
+
+				g_film_undo_broken = true;
+			}
+
+			while (g_film_window < std::min<u32>(written * 2, 0x100000))
+			{
+				g_film_window *= 2;
+			}
+		}
+
+		// A frame that runs again (after a load) replaces its entry and those after it
+		while (!g_film_undo.empty() && g_film_undo.back().frame >= frame)
+		{
+			g_film_undo.pop_back();
+		}
+
+		film_undo_entry e{frame, wp, g_film_window, {}, {}};
+		const u8* base = vm::get_super_ptr<u8>(data);
+		const u32 head = std::min<u32>(g_film_window, size - wp);
+		e.head.assign(base + wp, base + wp + head);
+
+		if (head < g_film_window)
+		{
+			const u32 w = std::min<u32>(g_film_window, size);
+			e.wrap.assign(base, base + w);
+		}
+
+		g_film_undo.push_back(std::move(e));
+
+		while (g_film_undo.size() > 64)
+		{
+			g_film_undo.pop_front();
+		}
+	}
+
+	// Right after a snapshot load to frame `target` (main thread)
+	void film_undo_after_load(u64 target)
+	{
+		if (!film_undo_on() || !g_film_data)
+		{
+			return;
+		}
+
+		u8* base = vm::get_super_ptr<u8>(g_film_data);
+		u32 undone = 0;
+
+		while (!g_film_undo.empty() && g_film_undo.back().frame >= target)
+		{
+			const film_undo_entry& e = g_film_undo.back();
+
+			// Wrap part first: the head part of the same entry is older in the ring order
+			if (!e.wrap.empty())
+			{
+				std::memcpy(base, e.wrap.data(), e.wrap.size());
+			}
+
+			std::memcpy(base + e.wp, e.head.data(), e.head.size());
+			g_film_undo.pop_back();
+			undone++;
+		}
+
+		if (g_film_undo_broken)
+		{
+			if (static u32 logged = 0; logged++ < 20)
+			{
+				rb_log.error("Film undo: load to frame %u after a frame that wrote more than the window; the film may hold records of the discarded frames", target);
+			}
+
+			g_film_undo_broken = false;
+		}
+
+		if (static u64 loads = 0; ++loads % 500 == 1)
+		{
+			rb_log.notice("Film undo: load to frame %u undid %u frames (window 0x%x, %u entries)", target, undone, g_film_window, g_film_undo.size());
+		}
+	}
+
 	void film_restore()
 	{
 		for (const auto& [addr, data] : g_film_copy)
@@ -1511,6 +1691,7 @@ namespace rb
 		}
 
 		g_boundary_frame = g_state.seq[0];
+		film_undo_boundary(g_boundary_frame);
 
 		// RB_NO_LIMIT=1: frame limiter off from the sync point (how fast can the game run frames?)
 		static const bool no_limit = get_env("RB_NO_LIMIT") == "1";

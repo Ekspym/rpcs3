@@ -50,6 +50,7 @@ namespace rb
 	u32 last_game_mode(); // game mode (FUN_0020c754) seen by the last re-simulated draw pass (diagnostics)
 	void film_save();
 	void film_restore();
+	void film_undo_after_load(u64 target); // RB_FILM_UNDO: undo the film data written by the frames after `target`
 
 	// Number of guest flips seen since boot.
 	u64 frame();

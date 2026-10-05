@@ -62,6 +62,7 @@ namespace rb
 		std::vector<u32> g_cal_pages;  // candidate page addresses
 		std::vector<u64> g_cal_hashes; // last hash of each candidate
 		std::vector<u8> g_cal_dirty;   // changed at least once
+		std::vector<u8> g_cal_cooled;  // how many times the page was cooled down (cooling hysteresis)
 		u64 g_cal_frames = 0;
 		bool g_cal_done = false;
 		bool g_cal_continuous = false; // RB_SNAP_CONT_CAL=1: keep calibrating during the stress test
@@ -452,6 +453,27 @@ namespace rb
 
 		std::vector<copy_piece> g_pieces;
 
+		// RB_SNAP_LOAD_CMP (default on, 0 = off): a load compares each piece with guest memory first and writes only the pieces
+		// that differ (reading is cheaper than writing the cache lines back); counters for the copy timing log
+		bool g_pieces_cmp = false;
+		std::atomic<u64> g_cmp_same_bytes{0}, g_cmp_diff_bytes{0};
+
+		void copy_one(const copy_piece& p)
+		{
+			if (g_pieces_cmp)
+			{
+				if (std::memcmp(p.dst, p.src, p.size) == 0)
+				{
+					g_cmp_same_bytes.fetch_add(p.size, std::memory_order_relaxed);
+					return;
+				}
+
+				g_cmp_diff_bytes.fetch_add(p.size, std::memory_order_relaxed);
+			}
+
+			std::memcpy(p.dst, p.src, p.size);
+		}
+
 		void add_piece(u8* dst, const u8* src, u32 size)
 		{
 			// Neighbouring pieces (consecutive pages) are merged, big ones split into 256 KiB parts
@@ -480,7 +502,7 @@ namespace rb
 			{
 				for (usz i; (i = next.fetch_add(1)) < g_pieces.size();)
 				{
-					std::memcpy(g_pieces[i].dst, g_pieces[i].src, g_pieces[i].size);
+					copy_one(g_pieces[i]);
 				}
 			}
 
@@ -536,7 +558,7 @@ namespace rb
 			{
 				for (const copy_piece& p : g_pieces)
 				{
-					std::memcpy(p.dst, p.src, p.size);
+					copy_one(p);
 				}
 
 				return;
@@ -798,6 +820,7 @@ namespace rb
 
 				g_cal_hashes.resize(g_cal_pages.size());
 				g_cal_dirty.assign(g_cal_pages.size(), 0);
+				g_cal_cooled.assign(g_cal_pages.size(), 0);
 				g_cal_shadow.assign(g_cal_pages.size() * 0x1000ull, 0);
 
 				// Write tracking first, then the shadow copy: a write in between is seen as a write
@@ -843,7 +866,11 @@ namespace rb
 			static usz sweep_pos = 0;
 			// RB_SNAP_SWEEP_ALL=1: verify every clean page every frame (diagnostics)
 			static const bool sweep_all = []() { const char* v = std::getenv("RB_SNAP_SWEEP_ALL"); return v && *v == '1'; }();
-			const usz sweep_count = !g_track_active ? 0 : sweep_all ? g_cal_pages.size() : g_cal_pages.size() / 256 + 1;
+			// RB_SNAP_SWEEP_LIVE_ONLY (default on, 0 = off): the safety-net sweep runs only at live boundaries, not at the
+			// re-simulated saves (the tracking catches PPU writes; the sweep cost ~60-130 us per boundary with ~37k candidates)
+			static const bool sweep_live_only = []() { const char* v = std::getenv("RB_SNAP_SWEEP_LIVE_ONLY"); return !v || *v != '0'; }();
+			const bool sweep_now = !(sweep_live_only && !sweep_all && state_resimulating(game_frame()));
+			const usz sweep_count = !g_track_active || !sweep_now ? 0 : sweep_all ? g_cal_pages.size() : g_cal_pages.size() / 256 + 1;
 
 			const auto mark_dirty = [&](usz i)
 			{
@@ -1252,10 +1279,18 @@ namespace rb
 				wait_flag() { if (cpu) cpu->state += cpu_flag::wait; }
 				~wait_flag() { if (cpu) { cpu->state -= cpu_flag::wait; cpu->check_state(); } }
 			} wait;
+
+			// RB_SNAP_COPY_TIMING (default on, 0 = off): host time of the copy parts (lock + layout, building the pieces, the copy),
+			// logged every 600 saves / loads
+			static const bool timing = []() { const char* v = std::getenv("RB_SNAP_COPY_TIMING"); return !v || *v != '0'; }();
+			static const bool load_cmp = []() { const char* v = std::getenv("RB_SNAP_LOAD_CMP"); return !v || *v != '0'; }();
+			const auto t0 = std::chrono::steady_clock::now();
+
 			vm::writer_lock vm_lock;
 
 			update_sync_exclusions();
 			refresh();
+			const auto t1 = std::chrono::steady_clock::now();
 			g_pieces.clear();
 
 			for (const page_unit& u : units)
@@ -1282,7 +1317,46 @@ namespace rb
 				}
 			}
 
+			const auto t2 = std::chrono::steady_clock::now();
+			g_pieces_cmp = !Save && load_cmp;
 			run_pieces();
+			g_pieces_cmp = false;
+
+			if (timing)
+			{
+				const auto t3 = std::chrono::steady_clock::now();
+				const auto us = [](auto a, auto b) { return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(b - a).count()); };
+
+				struct stat_t { u64 n = 0, lock = 0, build = 0, run = 0, lock_max = 0, build_max = 0, run_max = 0, pieces = 0, bytes = 0; };
+				static stat_t stats[2];
+				stat_t& st = stats[Save];
+				const u64 l = us(t0, t1), b = us(t1, t2), r = us(t2, t3);
+				st.n++;
+				st.lock += l, st.build += b, st.run += r;
+				st.lock_max = std::max(st.lock_max, l), st.build_max = std::max(st.build_max, b), st.run_max = std::max(st.run_max, r);
+				st.pieces += g_pieces.size();
+
+				for (const copy_piece& p : g_pieces)
+				{
+					st.bytes += p.size;
+				}
+
+				if (st.n == 600)
+				{
+					std::string cmp;
+
+					if (!Save && load_cmp)
+					{
+						const u64 same = g_cmp_same_bytes.exchange(0), diff = g_cmp_diff_bytes.exchange(0);
+						cmp = fmt::format(", compare: %u%% unchanged (%u KiB skipped, %u KiB written per load)", same + diff ? same * 100 / (same + diff) : 0,
+							same / 600 / 1024, diff / 600 / 1024);
+					}
+
+					rb_log.notice("Snapshot copy timing (%s, 600 calls): lock+layout avg %u us max %u, pieces avg %u us max %u, copy avg %u us max %u; %u pieces, %u KiB per call%s",
+						Save ? "save" : "load", st.lock / 600, st.lock_max, st.build / 600, st.build_max, st.run / 600, st.run_max, st.pieces / 600, st.bytes / 600 / 1024, cmp);
+					st = {};
+				}
+			}
 		}
 
 		usz bytes() const
@@ -1320,11 +1394,21 @@ namespace rb
 		const usz n = g_cal_pages.size();
 		const usz step = n / 64 + 1;
 
+		// RB_SNAP_COOL_HYST (default 0 = off): a page cooled down this many times (it became dirty again after cooling) is
+		// not cooled any more. Off by default: most pages cool and re-heat in bursts, so with a limit of 2 they all stayed in
+		// the store for good (o165: 2000 -> 4800 pages within 20 s, load/save 1.35 -> 2.8 ms); the churn is cheaper.
+		static const u32 cool_max = []() { const char* v = std::getenv("RB_SNAP_COOL_HYST"); return v ? static_cast<u32>(std::atoi(v)) : 0u; }();
+
+		if (g_cal_cooled.size() != n)
+		{
+			g_cal_cooled.assign(n, 0);
+		}
+
 		for (usz k = 0; k < step; k++)
 		{
 			const usz i = (pos + k) % n;
 
-			if (!g_cal_dirty[i])
+			if (!g_cal_dirty[i] || (cool_max && g_cal_cooled[i] >= cool_max))
 			{
 				continue;
 			}
@@ -1395,6 +1479,7 @@ namespace rb
 			}
 
 			g_cal_dirty[i] = 0;
+			g_cal_cooled[i] = static_cast<u8>(std::min<u32>(g_cal_cooled[i] + 1u, 255u));
 			g_store.remove(addr);
 			cooled++;
 		}
@@ -1677,6 +1762,70 @@ namespace rb
 		g_excluded.push_back({begin, end});
 		g_layout_gen++; // the saved parts of the pages are recomputed
 		rb_log.success("Snapshot excludes 0x%08x-0x%08x (%s)", begin, end, what);
+	}
+
+	void state_untracked_range(u32 begin, u32 end, bool add, const char* what)
+	{
+		const auto it = std::find_if(g_excluded.begin(), g_excluded.end(), [&](const range_t& r) { return r.begin == begin && r.end == end; });
+
+		if (add)
+		{
+			if (it != g_excluded.end())
+			{
+				return;
+			}
+
+			g_excluded.push_back({begin, end});
+			g_layout_gen++;
+			u32 pages = 0;
+
+			// Whole pages leave the store and the write tracking: writable, "dirty" for the calibration (never added, swept or
+			// cooled again), so the stream costs no fault / add / cooling any more
+			for (u32 page = (begin + 0xfff) & ~0xfffu; page + 0x1000 <= end; page += 0x1000)
+			{
+				const auto found = g_cal_index.find(page);
+
+				if (found == g_cal_index.end())
+				{
+					continue;
+				}
+
+				g_store.remove(page);
+				g_cal_dirty[found->second] = 1;
+
+				if (g_track && g_track[page >> 12].exchange(track_dirty) == track_clean)
+				{
+					protect_pages(page, 0x1000, utils::protection::rw);
+				}
+
+				pages++;
+			}
+
+			rb_log.success("Snapshot excludes 0x%08x-0x%08x (%s), %u pages no longer saved or tracked", begin, end, what, pages);
+			return;
+		}
+
+		if (it == g_excluded.end())
+		{
+			return;
+		}
+
+		g_excluded.erase(it);
+		g_layout_gen++;
+		u32 pages = 0;
+
+		// Back in the snapshot: every slot gets the current content (normally a new match follows, whose memory map change
+		// invalidates the ring anyway)
+		for (u32 page = (begin + 0xfff) & ~0xfffu; page + 0x1000 <= end; page += 0x1000)
+		{
+			if (g_cal_index.count(page) && vm::check_addr(page, vm::page_readable))
+			{
+				g_store.add(page, vm::get_super_ptr<u8>(page));
+				pages++;
+			}
+		}
+
+		rb_log.success("Snapshot includes 0x%08x-0x%08x again (%s), %u pages", begin, end, what, pages);
 	}
 
 	bool state_net_ready()
@@ -2188,6 +2337,7 @@ namespace rb
 					g_store.copy<false>(to_slot);
 					film_restore();
 					task_check(to, "after load");
+					film_undo_after_load(to);
 
 					// Snapshots after the restored frame belong to the discarded timeline (online mode saves no boundary
 					// during the re-simulation, so they would otherwise stay valid for a second rollback)
@@ -2266,6 +2416,7 @@ namespace rb
 				g_store.copy<false>(from_slot);
 				film_restore();
 				task_check(from, "after load");
+				film_undo_after_load(from);
 				online::stress_sound_after_load(from);
 				const u64 us = elapsed_us(start);
 
