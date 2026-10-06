@@ -57,6 +57,22 @@ extern bool ppu_form_branch_to_code(u32 entry, u32 target);
 namespace rb::online
 {
 	static bool predict_game_mode();
+	static bool run_receiver(ppu_thread& ppu);
+
+	// RB_NET_TIMING=1: steady clock (us) when a remote frame's input was first stored and when it was first predicted
+	static void rb_timing(const char* what, u32 frame)
+	{
+		static const bool on = std::getenv("RB_NET_TIMING") && *std::getenv("RB_NET_TIMING") == '1';
+
+		if (on)
+		{
+			if (static std::atomic<u32> logged = 0; logged++ < 40000)
+			{
+				rb_online_log.notice("RB timing %s %u t=%llu", what, frame,
+					std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+			}
+		}
+	}
 
 	namespace
 	{
@@ -161,6 +177,7 @@ namespace rb::online
 		bool g_sync_hold = false;
 		double g_sync_avg = 0.0;
 		u64 g_sync_last_hold = 0, g_sync_holds = 0;
+		u64 g_live_pred_count = 0, g_live_pred_depth = 0; // live predictions and their depth (frames beyond the available ones)
 		u64 g_predictions = 0, g_mispredictions = 0, g_rollbacks = 0, g_resim_frames = 0;
 		u64 g_dbg_get_remote = 0, g_dbg_get_missing = 0, g_dbg_store_remote = 0, g_dbg_store_local = 0;
 
@@ -491,6 +508,45 @@ namespace rb::online
 			// the re-simulation, no snapshot was saved meanwhile and the next rollback found no slot (o98, ANALYZA.md 37)
 			const bool resim = is_resimulating();
 
+			// RB_ONLINE_RECV_WAIT_US (default 0 = off): in a live fight frame whose remote input is the only one missing, wait up
+			// to this long for it (running the game's receiver every 250 us) before predicting. At a low ping the input arrives
+			// a few ms after this check: a short wait is cheaper than the rollback (v1.0 test, 15 ms RTT: 68 % of the remote
+			// inputs were predicted, 20 % of them wrong)
+			static const u64 recv_wait_us = std::getenv("RB_ONLINE_RECV_WAIT_US") ? std::strtoull(std::getenv("RB_ONLINE_RECV_WAIT_US"), nullptr, 10) : 0;
+
+			if (recv_wait_us && !resim && mode == 1 && player == remote_player(mgr) && sim == available && in_fight() && predict_game_mode() &&
+				(ppu.lr == 0x004229a0 || ppu.lr == 0x004229b8))
+			{
+				static u64 waited = 0, got = 0, total_us = 0;
+				const auto start = std::chrono::steady_clock::now();
+				bool arrived = false;
+				waited++;
+
+				while (std::chrono::steady_clock::now() - start < std::chrono::microseconds(recv_wait_us))
+				{
+					std::this_thread::sleep_for(std::chrono::microseconds(250));
+
+					if (run_receiver(ppu) && vm::read32(mgr + 0x58 + i * 4) > sim && (vm::read8(flags) & 1))
+					{
+						arrived = true;
+						break;
+					}
+				}
+
+				total_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+				got += arrived;
+
+				if (waited % 600 == 0)
+				{
+					rb_online_log.notice("Receive wait: %u of %u waits got the remote input, avg %u us", got, waited, total_us / waited);
+				}
+
+				if (arrived)
+				{
+					return 1;
+				}
+			}
+
 			if (config().predict && mode == 1 && in_fight() && ring_ready() && !g_sim_at.empty() && player == remote_player(mgr) && sim > 0 &&
 				((resim && sim <= g_resim_sim_limit) || (sim < available + config().max_predict && !too_old && !g_sync_hold && predict_game_mode())) && (vm::read8(flag_addr(mgr, i, sim - 1)) & 1))
 			{
@@ -498,6 +554,13 @@ namespace rb::online
 				std::memcpy(vm::get_super_ptr<u8>(slot_addr(mgr, i, sim)), prev.data(), entry_size);
 				vm::write8(flags, 1);
 				g_predicted[sim] = prev;
+
+				if (!g_predicted_at.contains(sim) && !resim)
+				{
+					g_live_pred_count++;
+					g_live_pred_depth += sim + 1 - available;
+					rb_timing("predict", sim);
+				}
 
 				if (!g_predicted_at.contains(sim) || !is_resimulating())
 				{
@@ -593,6 +656,11 @@ namespace rb::online
 						rb_online_log.error("Remote input of frame %u changed (sim %u, available %u, game frame %u):%s", frame,
 							+vm::read32(mgr + 0x60 + i * 4), +vm::read32(mgr + 0x58 + i * 4), seq[0], diff);
 					}
+				}
+
+				if (!g_remote.contains(frame) && !is_resimulating())
+				{
+					rb_timing("remote", frame);
 				}
 
 				if (!g_remote.contains(frame) || g_remote[frame] != real)
@@ -3224,26 +3292,15 @@ namespace rb::online
 		}
 		}
 
-	// RB_ONLINE_EARLY_RECV (default on, 0 = off): at the end of a live frame the game's receiver FUN_00422478(manager) runs
-	// once more, so the remote inputs that arrived during the frame's vblank wait are stored now and a misprediction is
-	// rolled back at the next boundary instead of one frame later (each rollback was one frame deeper than needed). The
-	// receiver counts calls (+0x88 statistics, +0x64 = 100: disconnect timeout > 299, reset when both sides are ready):
-	// both are restored, so the extra call does not shorten the timeout.
-	void end_of_frame(ppu_thread& ppu)
+	// Runs the game's receiver FUN_00422478(net) once (the session must be connected); its call counters (+0x88 statistics,
+	// +0x64 disconnect timeout) are restored, so an extra call does not shorten the timeout. Returns whether it ran
+	static bool run_receiver(ppu_thread& ppu)
 	{
-		static const bool on = !std::getenv("RB_ONLINE_EARLY_RECV") || *std::getenv("RB_ONLINE_EARLY_RECV") != '0';
-		const u32 mgr = manager();
-
-		if (!on || !config().predict || !mgr || !in_fight() || !use_stress_ring() || !state_stress_ready())
-		{
-			return;
-		}
-
 		const u32 net = net_manager_object();
 
 		if (!net || vm::read32(net + 0x5c) == 0)
 		{
-			return;
+			return false;
 		}
 
 		const u32 old_r1 = static_cast<u32>(ppu.gpr[1]);
@@ -3279,6 +3336,33 @@ namespace rb::online
 		}
 
 		ppu.gpr[1] = old_r1;
+
+		return ok;
+	}
+
+	// RB_ONLINE_EARLY_RECV (default on, 0 = off): at the end of a live frame the game's receiver FUN_00422478(manager) runs
+	// once more, so the remote inputs that arrived during the frame's vblank wait are stored now and a misprediction is
+	// rolled back at the next boundary instead of one frame later (each rollback was one frame deeper than needed). The
+	// receiver counts calls (+0x88 statistics, +0x64 = 100: disconnect timeout > 299, reset when both sides are ready):
+	// both are restored, so the extra call does not shorten the timeout.
+	void end_of_frame(ppu_thread& ppu)
+	{
+		static const bool on = !std::getenv("RB_ONLINE_EARLY_RECV") || *std::getenv("RB_ONLINE_EARLY_RECV") != '0';
+		const u32 mgr = manager();
+
+		if (!on || !config().predict || !mgr || !in_fight() || !use_stress_ring() || !state_stress_ready())
+		{
+			return;
+		}
+
+		const u32 net = net_manager_object();
+
+		if (!net || vm::read32(net + 0x5c) == 0)
+		{
+			return;
+		}
+
+		const bool ok = run_receiver(ppu);
 
 		if (ok && g_mismatch_frame != umax)
 		{
@@ -3499,6 +3583,10 @@ namespace rb::online
 
 		game_mode_frame();
 		sound_frame();
+		if (mgr && fight_markers() && !is_resimulating())
+		{
+			rb_timing("frame", vm::read32(mgr + 0x60 + (2 - remote_player(mgr)) * 4));
+		}
 		g_fight_frames = mgr && fight_markers() ? g_fight_frames + 1 : 0;
 
 		// Time synchronisation (see g_sync_hold): measured in live fight frames only
@@ -3523,9 +3611,40 @@ namespace rb::online
 					g_sync_holds++;
 				}
 
+				// RB_ONLINE_SYNC_PRED (default 0 = off; 0.5 tested: fewer but deeper rollbacks at 34 ms, o205/o206): the share of live frames that predicted the remote input, with the
+				// prediction depth. Predicting about one frame in most frames = this side runs a whole frame ahead of the other
+				// (at a low ping the input of the frame arrives just after it was needed: o203, 15 ms RTT, the input was sent
+				// at 0.7 ms and needed at 0.65 ms into the frame, 7.6 ms on the way). One frame waits for it and both sides line
+				// up. Deeper predictions (high ping) are not a frame advantage: left to the auto input delay
+				static const double pred_target = std::getenv("RB_ONLINE_SYNC_PRED") ? std::atof(std::getenv("RB_ONLINE_SYNC_PRED")) : 0.0;
+				static u64 last_count = 0, last_depth = 0;
+				static double pred_share = 0.0, pred_depth = 0.0;
+				const u64 dc = g_live_pred_count - last_count, dd = g_live_pred_depth - last_depth;
+				last_count = g_live_pred_count;
+				last_depth = g_live_pred_depth;
+				pred_share += ((dc ? 1.0 : 0.0) - pred_share) / 60.0;
+
+				if (dc)
+				{
+					pred_depth += (static_cast<double>(dd) / static_cast<double>(dc) - pred_depth) / 30.0;
+				}
+
+				if (pred_target > 0 && !g_sync_hold && pred_share > pred_target && pred_depth < 1.5 && sq[0] - g_sync_last_hold >= 60)
+				{
+					g_sync_hold = true;
+					g_sync_last_hold = sq[0];
+					g_sync_holds++;
+					pred_share = 0.0;
+
+					if (static u32 logged = 0; logged++ < 30)
+					{
+						rb_online_log.notice("Time sync: predicting in most frames by ~%.1f frame: one frame waits for the remote input", pred_depth);
+					}
+				}
+
 				if (static u64 n = 0; ++n % 600 == 0)
 				{
-					rb_online_log.notice("Time sync: %.2f frames predicted on average, %u frames waited so far (target %.1f)", g_sync_avg, g_sync_holds, target);
+					rb_online_log.notice("Time sync: %.2f frames predicted on average, %u frames waited so far (target %.1f), live frames predicting %.0f %%", g_sync_avg, g_sync_holds, target, pred_share * 100);
 				}
 			}
 			else if (!mgr || !in_fight())

@@ -935,11 +935,13 @@ namespace rb
 				vm::read32(obj + 0x60), vm::read32(node + 0x44));
 		}
 
-		// Steady state: the generic step, the draw root's state FUN_001060d8 (descriptor 0x00933148), or the sound device's
-		// state FUN_002c69d8 (sound library update per frame; the library is not rolled back, re-simulated frames must not
-		// advance it)
+		// Steady state: the generic step (descriptor 0x0092CC00 -> FUN_00017534, or 0x00932BE8 -> FUN_000ff1a0 = "call the
+		// object's update vtable+0x18", the steady step of e.g. CINetMatching, tcb_owwindow_t, tcb_stage_particle_t: without it
+		// these listed tasks were never skipped, o209), the draw root's state FUN_001060d8 (descriptor 0x00933148), or the
+		// sound device's state FUN_002c69d8 (sound library update per frame; the library is not rolled back, re-simulated
+		// frames must not advance it)
 		const u32 state = vm::read32(obj + 0x60);
-		const bool steady = step == 0x0092CC00u || state == 0x00933148u ||
+		const bool steady = step == 0x0092CC00u || step == 0x00932BE8u || state == 0x00933148u ||
 			(!(state & 1) && state && vm::check_addr(state, vm::page_readable) && vm::read32(state) == 0x002c69d8u);
 
 		if (!steady)

@@ -62,6 +62,33 @@ namespace
 		return dropped;
 	}
 
+	// tekken-rollback: RB_NET_TIMING=1 logs every game P2P packet on its way (send by the game, arrival in the socket queue,
+	// read by the game) with the steady clock in us and a hash of the payload: two local instances share the clock, so the
+	// delay of each stage is measurable (tools/net_timing.py)
+	void rb_net_timing(const char* what, const u8* d, usz size)
+	{
+		static const bool on = std::getenv("RB_NET_TIMING") && *std::getenv("RB_NET_TIMING") == '1';
+
+		if (!on)
+		{
+			return;
+		}
+
+		u32 h = 2166136261u;
+
+		for (usz k = 0; k < size; k++)
+		{
+			h = (h ^ d[k]) * 16777619u;
+		}
+
+		const u64 us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+
+		if (static std::atomic<u32> logged = 0; logged++ < 60000)
+		{
+			sys_net.notice("P2P timing %s t=%llu len=%u h=%08x", what, us, size, h);
+		}
+	}
+
 	u32 lag_ms()
 	{
 		static const u32 ms = []() { const char* v = std::getenv("RB_NET_LAG_MS"); return v ? static_cast<u32>(std::atoi(v)) : 0u; }();
@@ -143,6 +170,7 @@ void lv2_socket_p2p::handle_new_data(sys_net_sockaddr_in_p2p p2p_addr, std::vect
 	std::lock_guard lock(mutex);
 
 	sys_net.trace("Received a P2P packet for vport %d and saved it", p2p_addr.sin_vport);
+	rb_net_timing("in", p2p_data.data(), p2p_data.size());
 	data.push(std::make_pair(std::move(p2p_addr), std::move(p2p_data)));
 
 	// Check if poll is happening
@@ -350,6 +378,7 @@ std::optional<std::tuple<s32, std::vector<u8>, sys_net_sockaddr>> lv2_socket_p2p
 	std::vector<u8> res_buf(len);
 
 	const auto& p2p_data = data.front();
+	rb_net_timing("read", p2p_data.second.data(), p2p_data.second.size());
 	s32 native_result    = std::min(len, static_cast<u32>(p2p_data.second.size()));
 	memcpy(res_buf.data(), p2p_data.second.data(), native_result);
 
@@ -372,6 +401,7 @@ std::optional<s32> lv2_socket_p2p::sendto(s32 flags, const std::vector<u8>& buf,
 
 	ensure(opt_sn_addr);
 	ensure(native_socket); // ensures it has been bound
+	rb_net_timing("out", buf.data(), buf.size());
 	ensure(buf.size() <= static_cast<usz>(65535 - VPORT_P2P_HEADER_SIZE)); // catch games using full payload for future fragmentation implementation if necessary
 	const u16 p2p_port  = reinterpret_cast<const sys_net_sockaddr_in*>(&*opt_sn_addr)->sin_port;
 	const u16 p2p_vport = reinterpret_cast<const sys_net_sockaddr_in_p2p*>(&*opt_sn_addr)->sin_vport;
