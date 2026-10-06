@@ -1499,6 +1499,21 @@ namespace rb::online
 		return on;
 	}
 
+	// Frame and re-simulation state for the sound code: the frame of the main loop boundary, not the pad read position seq[0],
+	// which the port 0 read advances at the start of the frame. A PLAY (after the read) in the last re-simulated frame L-1 saw
+	// seq[0] = L and state_resimulating(L) = false: it counted as live, was not deduplicated and the sound started a second
+	// time a few ms after the first (online: at every rollback; offline depth-1 stress: always). The other users of
+	// is_resimulating() (input, saves) keep their behaviour.
+	u32 sound_frame_no()
+	{
+		return static_cast<u32>(boundary_frame());
+	}
+
+	bool sound_resim()
+	{
+		return (use_stress_ring() || stress_sound()) ? state_resimulating(boundary_frame()) : is_resimulating();
+	}
+
 	// Sounds are recorded (dedup, discarded stop, leak cleanup) in the online fight, or in the offline stress with RB_STRESS_SOUND
 	bool sound_recording_active()
 	{
@@ -1514,6 +1529,13 @@ namespace rb::online
 	// Sound diagnostics (every 600 live frames): starts, failed starts (by code), starts skipped as already playing, stops of
 	// discarded sounds, active voices of the library
 	u64 g_snd_ok = 0, g_snd_fail = 0, g_snd_claimed = 0, g_snd_stopped = 0;
+	u64 g_snd_skipped = 0; // re-simulated PLAYs not started (RB_SOUND_SIMPLE)
+
+	bool sound_simple()
+	{
+		static const bool on = !std::getenv("RB_SOUND_SIMPLE") || *std::getenv("RB_SOUND_SIMPLE") != '0';
+		return on;
+	}
 	std::map<s32, u64> g_snd_fail_codes;
 
 	// RB_SOUND_PAGES=1 (diagnostics): snapshot pages changed by the sound library (PLAY, the per-frame library update):
@@ -1630,7 +1652,7 @@ namespace rb::online
 
 		void begin()
 		{
-			if (applied || active || !target() || !fight_active() || is_resimulating())
+			if (applied || active || !target() || !fight_active() || sound_resim())
 			{
 				return;
 			}
@@ -1727,12 +1749,14 @@ namespace rb::online
 
 	void sound_learn_begin()
 	{
+		state_file_foreign_scope(true);
 		g_sound_learner.begin();
 	}
 
 	void sound_learn_end()
 	{
 		g_sound_learner.end();
+		state_file_foreign_scope(false);
 	}
 
 	s32 hle_sound_play(ppu_thread& ppu)
@@ -1742,26 +1766,57 @@ namespace rb::online
 		const u32 bank = static_cast<u32>(ppu.gpr[3]);
 		const u32 cue = static_cast<u32>(ppu.gpr[4]);
 		const u32 out = vm::read32(old_r1 + 0x74);
+		const u32 caller = static_cast<u32>(ppu.lr);
 		u32 seq[2]{};
 		get_seq(seq);
-		const bool resim = is_resimulating();
+		seq[0] = sound_frame_no();
+		const bool resim = sound_resim();
 
 		if (resim && sound_dedup())
 		{
+			// The same sound of the discarded timeline is taken over when it started within RB_SOUND_MATCH_FRAMES (default 3)
+			// frames of this one (the nearest): after a misprediction a hit lands a frame or two earlier or later, and
+			// stopping the first one and starting it again cut the sound (heard as distortion of some effects)
+			static const u64 tol = std::getenv("RB_SOUND_MATCH_FRAMES") ? std::strtoull(std::getenv("RB_SOUND_MATCH_FRAMES"), nullptr, 10) : 3;
+			sound_play_t* best = nullptr;
+			u64 best_d = umax;
+
 			for (auto& p : g_sound_plays)
 			{
-				if (!p.claimed && p.frame == seq[0] && p.out == out && p.bank == bank && p.cue == cue)
+				// The same sound object is preferred; a sound of another object (restored with another address) only counts
+				// with a penalty
+				if (!p.claimed && p.bank == bank && p.cue == cue)
 				{
-					p.claimed = true;
+					const u64 d = (p.frame > seq[0] ? p.frame - seq[0] : seq[0] - p.frame) + (p.out == out ? 0 : 1);
 
-					if (out)
+					if (d <= tol + 1 && d < best_d)
 					{
-						vm::write32(out, p.handle);
+						best = &p;
+						best_d = d;
 					}
-
-					g_snd_claimed++;
-					return 0;
 				}
+			}
+
+			if (best)
+			{
+				best->claimed = true;
+
+				if (out)
+				{
+					vm::write32(out, best->handle);
+				}
+
+				g_snd_claimed++;
+				return 0;
+			}
+
+			// RB_SOUND_SIMPLE (default on, 0 = off): sound ignores rollbacks. What played, plays on (never stopped after a
+			// re-simulation); a re-simulated frame starts nothing new. A sound that only the corrected timeline has is not
+			// heard (rare: a mispredicted hit); every cut or restart was heard as distortion.
+			if (sound_simple())
+			{
+				g_snd_skipped++;
+				return 0;
 			}
 		}
 
@@ -1860,6 +1915,16 @@ namespace rb::online
 			}
 		}
 
+		// RB_SOUND_TRACE=1: every PLAY of the fight with frame, bank/cue, object field, caller (first 400)
+		if (static const bool trace = std::getenv("RB_SOUND_TRACE") && *std::getenv("RB_SOUND_TRACE") == '1'; trace && sound_recording_active())
+		{
+			if (static u32 traced = 0; traced++ < 400)
+			{
+				rb_online_log.notice("Sound PLAY %s: frame %u, bank %u, cue %u, out 0x%08x, cosmetic %d, ret %d, lr 0x%08x, task 0x%08x", resim ? "resim (unmatched)" : "live",
+					seq[0], bank, cue, out, in_cosmetic_work(), ret, caller, current_task_method());
+			}
+		}
+
 		if (ret == 0 && out && sound_dedup() && sound_recording_active())
 		{
 			g_sound_plays.push_back({seq[0], out, bank, cue, vm::read32(out), resim, in_cosmetic_work(), false});
@@ -1915,6 +1980,106 @@ namespace rb::online
 		}
 	}
 
+	// RB_SOUND_KEEP_RUNTIME=1: the playback runtime of the bnusCore voices (0x2f0 each, [v, v+0x150): position, decoder history,
+	// envelope, SPU status; written by the SPU mixer) survives a snapshot load for voices that exist unchanged in both timelines
+	// (same allocation, generation +0x1a4, valid +0x1ac and host request +0x1a8 before and after the load). The voices stay in
+	// the snapshot (splitting a voice between restored and live parts crashed at the first rollback, RB_SOUND_EXCL_CORE_RUN);
+	// only their playback progress is put back after the load, so playing sounds no longer jump back at every rollback.
+	struct voice_runtime_t
+	{
+		u8 alloc;
+		u32 gen, req, valid;
+		std::array<u8, 0x150> data;
+	};
+
+	std::vector<voice_runtime_t> g_voice_rt;
+	bool g_voice_rt_taken = false;
+
+	bool sound_keep_runtime()
+	{
+		static const bool on = std::getenv("RB_SOUND_KEEP_RUNTIME") && *std::getenv("RB_SOUND_KEEP_RUNTIME") == '1';
+		return on;
+	}
+
+	static bool core_voices(u32& core, u32& n)
+	{
+		constexpr u32 g = 0x00D66D60;
+		core = vm::read32(g + 0xc0);
+		n = vm::read32(g + 0x80);
+		return core && n && n <= 0x400 && vm::check_addr(core, vm::page_readable | vm::page_writable, n * 0x2f0);
+	}
+
+	void sound_runtime_before_load()
+	{
+		g_voice_rt_taken = false;
+		u32 core = 0, n = 0;
+
+		if (!sound_keep_runtime() || !core_voices(core, n))
+		{
+			return;
+		}
+
+		g_voice_rt.resize(n);
+
+		for (u32 i = 0; i < n; i++)
+		{
+			const u32 v = core + i * 0x2f0;
+			voice_runtime_t& e = g_voice_rt[i];
+			e.alloc = vm::read8(v + 0x1a0);
+			e.gen = vm::read32(v + 0x1a4);
+			e.req = vm::read32(v + 0x1a8);
+			e.valid = vm::read32(v + 0x1ac);
+			std::memcpy(e.data.data(), vm::get_super_ptr<u8>(v), 0x150);
+		}
+
+		g_voice_rt_taken = true;
+	}
+
+	void sound_runtime_after_load()
+	{
+		if (!g_voice_rt_taken)
+		{
+			return;
+		}
+
+		g_voice_rt_taken = false;
+		u32 core = 0, n = 0;
+
+		if (!core_voices(core, n) || n != g_voice_rt.size())
+		{
+			return;
+		}
+
+		u32 kept = 0, changed = 0;
+
+		for (u32 i = 0; i < n; i++)
+		{
+			const u32 v = core + i * 0x2f0;
+			const voice_runtime_t& e = g_voice_rt[i];
+
+			if (!e.alloc || !e.valid)
+			{
+				continue;
+			}
+
+			if (vm::read8(v + 0x1a0) && vm::read32(v + 0x1a4) == e.gen && vm::read32(v + 0x1ac) == e.valid && vm::read32(v + 0x1a8) == e.req)
+			{
+				std::memcpy(vm::get_super_ptr<u8>(v), e.data.data(), 0x150);
+				kept++;
+			}
+			else
+			{
+				changed++;
+			}
+		}
+
+		if (static u64 loads = 0, total_kept = 0, total_changed = 0; total_kept += kept, total_changed += changed, ++loads % 100 == 1)
+		{
+			rb_online_log.notice("Sound runtime kept across loads: this load %u voices kept, %u not (changed in the discarded frames); %u loads, %u kept, %u not in total",
+				kept, changed, loads, total_kept, total_changed);
+		}
+	}
+
 	// Once per main loop frame: game mode changes (with the phase counter *(*0x00967cf4 + 0x24)) and, in the KO replay
 	// (mode 6, ends at counter 600 = 480 + 120 frames or when skipped), its progress every 60 frames
 	static void game_mode_frame()
@@ -1955,7 +2120,8 @@ namespace rb::online
 
 		u32 seq[2]{};
 		get_seq(seq);
-		const bool resim = is_resimulating();
+		seq[0] = sound_frame_no();
+		const bool resim = sound_resim();
 
 		if (resim)
 		{
@@ -1967,7 +2133,30 @@ namespace rb::online
 
 			for (auto it = g_sound_plays.begin(); it != g_sound_plays.end();)
 			{
-				if (it->frame >= g_sound_resim_first && it->frame < seq[0] && !it->claimed && !it->cosmetic)
+				// A sound whose game object still holds its handle after the re-simulation is alive in the corrected timeline:
+				// the object saw it playing (the sound library is not rolled back) and did not start it again. Stopping it made
+				// the next live frame start it once more: cut + restart of most hit sounds at every rollback = the distortion
+				// (offline replay with identical inputs: 78 stopped, 65 started again). RB_SOUND_KEEP_HELD=0: old behaviour
+				static const bool keep_held = !std::getenv("RB_SOUND_KEEP_HELD") || *std::getenv("RB_SOUND_KEEP_HELD") != '0';
+				bool held = keep_held && it->out && vm::check_addr(it->out, vm::page_readable) && vm::read32(it->out) == it->handle;
+
+				// Two sounds started into the same object field in the same frame: the second handle overwrote the first, and
+				// the game never stopped the first one. While the object holds the second, the first stays too
+				if (keep_held && !held && it->out && vm::check_addr(it->out, vm::page_readable))
+				{
+					const u32 now = vm::read32(it->out);
+
+					for (const auto& q : g_sound_plays)
+					{
+						if (&q != &*it && q.out == it->out && q.handle == now && q.frame == it->frame)
+						{
+							held = true;
+							break;
+						}
+					}
+				}
+
+				if (!sound_simple() && it->frame >= g_sound_resim_first && it->frame < seq[0] && !it->claimed && !it->cosmetic && !held)
 				{
 					auto& ppu = *get_current_cpu_thread<ppu_thread>();
 					const u32 old_r1 = static_cast<u32>(ppu.gpr[1]);
@@ -2191,7 +2380,7 @@ namespace rb::online
 	// manager is not part of the snapshot, so this does not change the restored game state.
 	u32 hle_sound_bank_lookup(ppu_thread& ppu, u32 bm, u32 bank, u32 out)
 	{
-		if (ppu.lr == 0x00694c70 && is_resimulating() && !sound_dedup())
+		if (ppu.lr == 0x00694c70 && sound_resim() && !sound_dedup())
 		{
 			static u64 muted = 0;
 
@@ -3135,6 +3324,71 @@ namespace rb::online
 				}
 
 				rb_online_log.success("Sound core outside the rollback: %u voices at 0x%08x, list 0x%08x (%u)", n, core, list, list_n);
+			}
+		}
+
+		// Staged exclusions of the lower sound layers (analysis_sound_rollback_distortion.md). The upper layer (manager, banks, voice
+		// table) is already outside the rollback and KeyOn is deduplicated; restoring the lower layers rewound every playing voice
+		// on each load (all sounds distorted at every rollback). RB_SOUND_EXCL_LOWER also excluded the whole nuSound2 group head
+		// (T+0..0x24010) and froze the mixer (o171); these stages leave it alone.
+		if (std::getenv("RB_ONLINE_SOUND_ROLLBACK") == nullptr)
+		{
+			const auto env_on = [](const char* name) { const char* v = std::getenv(name); return v && *v == '1'; };
+			static const bool core_run = env_on("RB_SOUND_EXCL_CORE_RUN");
+			static const bool core_all = env_on("RB_SOUND_EXCL_CORE_ALL");
+			static const bool voice_states = env_on("RB_SOUND_EXCL_VOICE_STATES");
+			constexpr u32 g = 0x00D66D60;
+
+			// (1) RB_SOUND_EXCL_CORE_RUN: per bnusCore voice (0x2f0) only the SPU mixer runtime [v, v+0x150): playback
+			// position, decoder history, envelope and the SPU status (+0x140 state, +0x144 flags, +0x148 parameter). The PPU
+			// parameters and the KeyOn handshake (+0x160..) stay in the snapshot.
+			// (2) RB_SOUND_EXCL_CORE_ALL: the whole core voices and the voice list *(g+0xd8) (instead of (1))
+			if (static u32 last_core = 0; core_run || core_all)
+			{
+				const u32 core = vm::read32(g + 0xc0);
+				const u32 n = vm::read32(g + 0x80);
+
+				if (core && core != last_core && n && n <= 0x400 && vm::check_addr(core, vm::page_readable, n * 0x2f0))
+				{
+					last_core = core;
+
+					if (core_all)
+					{
+						state_exclude(core, core + n * 0x2f0, "sound core voices (whole)");
+						const u32 list = vm::read32(g + 0xd8);
+						const u32 list_n = vm::read32(g + 0xd0);
+
+						if (list && list_n && list_n <= 0x1000 && vm::check_addr(list, vm::page_readable))
+						{
+							state_exclude(list, list + list_n * 4, "sound core voice list");
+						}
+
+						rb_online_log.success("Sound stage CORE_ALL: %u core voices at 0x%08x outside the rollback (list 0x%08x)", n, core, list);
+					}
+					else
+					{
+						for (u32 i = 0; i < n; i++)
+						{
+							state_exclude(core + i * 0x2f0, core + i * 0x2f0 + 0x150, "sound core voice runtime");
+						}
+
+						rb_online_log.success("Sound stage CORE_RUN: runtime [+0, +0x150) of %u core voices at 0x%08x outside the rollback", n, core);
+					}
+				}
+			}
+
+			// (3) RB_SOUND_EXCL_VOICE_STATES: the nuSound2 voice states (0xC0 x 0x48 at T+0x24014: core voice binding +4/+8,
+			// state +0x20, params) - without the group head T+0..0x24010
+			if (static u32 last_t = 0; voice_states)
+			{
+				const u32 t = vm::read32(0x00D65ABC);
+
+				if (t && t != last_t && vm::check_addr(t + 0x24014, vm::page_readable, 0xC0 * 0x48))
+				{
+					last_t = t;
+					state_exclude(t + 0x24014, t + 0x24014 + 0xC0 * 0x48, "sound voice states (without the group head)");
+					rb_online_log.success("Sound stage VOICE_STATES: 0x%08x-0x%08x outside the rollback", t + 0x24014, t + 0x24014 + 0xC0 * 0x48);
+				}
 			}
 		}
 	}

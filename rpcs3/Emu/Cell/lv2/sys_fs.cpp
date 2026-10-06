@@ -5,6 +5,7 @@
 #include "util/asm.hpp"
 
 #include "Emu/Cell/PPUThread.h"
+#include "Emu/Rollback/rb_state.h"
 #include "Emu/Cell/timers.hpp"
 #include "Crypto/unedat.h"
 #include "Emu/system_config.h"
@@ -743,7 +744,9 @@ u64 lv2_file::op_read(const fs::file& file, vm::ptr<void> buf, u64 size, u64 opt
 	{
 		// Optimize reads from safe memory
 		const auto buf_ptr = vm::get_super_ptr(buf.addr());
-		return (opt_pos == umax ? file.read(buf_ptr, size) : file.read_at(opt_pos, buf_ptr, size));
+		const u64 nread = (opt_pos == umax ? file.read(buf_ptr, size) : file.read_at(opt_pos, buf_ptr, size));
+		rb::note_file_read(buf.addr(), nread);
+		return nread;
 	}
 
 	// Copy data from intermediate buffer (avoid passing vm pointer to a native API)
@@ -765,6 +768,7 @@ u64 lv2_file::op_read(const fs::file& file, vm::ptr<void> buf, u64 size, u64 opt
 		}
 	}
 
+	rb::note_file_read(buf.addr(), result);
 	return result;
 }
 

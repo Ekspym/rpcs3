@@ -77,4 +77,8 @@ namespace rb
 
 	bool on_write_fault(u32 addr);
 	void note_write(u32 addr, u32 size);
+	// A file read into guest memory (lv2_file::op_read, written through the host view without a fault)
+	void note_file_read(u32 addr, u64 size);
+	// Sound update of a live frame (main thread): its file reads (music stream refill) are not rolled back
+	void state_file_foreign_scope(bool enter);
 }

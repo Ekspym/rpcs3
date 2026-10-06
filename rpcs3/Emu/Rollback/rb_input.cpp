@@ -625,6 +625,11 @@ namespace rb
 	// sentinel root + 4 through +0x10 (next); +0x14 prev, +0x18 parent, +0x1c next sibling, +0x20 prev sibling, +0x24 first child
 	u32 g_task_root = 0;
 
+	u64 boundary_frame()
+	{
+		return g_boundary_frame;
+	}
+
 	u32 rb_frame_end(ppu_thread& ppu, u64 param)
 	{
 		const u32 old_r1 = static_cast<u32>(ppu.gpr[1]);
@@ -956,6 +961,13 @@ namespace rb
 		return vm::read32(static_cast<u32>(ppu.gpr[3]) + 0x10);
 	}
 
+	u32 g_task_method_now = 0; // task method (vtable) whose step runs now (diagnostics)
+
+	u32 current_task_method()
+	{
+		return g_task_method_now;
+	}
+
 	void rb_subtask_walk(ppu_thread& ppu, u64 owner, u32 node, u32 end)
 	{
 		// A task list that leads back into a subtree whose walk is still running recurses until the guest stack is gone
@@ -1044,9 +1056,12 @@ namespace rb
 					online::sound_learn_begin();
 				}
 
+				const u32 outer_method = g_task_method_now;
+				g_task_method_now = method;
 				ppu.gpr[3] = cur;
 				ppu.gpr[4] = 1;
 				ppu.fast_call(tekken_task_step, tekken_toc);
+				g_task_method_now = outer_method;
 
 				if (sound_device)
 				{

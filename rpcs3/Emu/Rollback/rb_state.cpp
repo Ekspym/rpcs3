@@ -110,6 +110,13 @@ namespace rb
 
 		void mark_foreign(u32 page, const std::string& writer)
 		{
+			// Never in the game heap arena (0x10090000-0x120D0000, H+0x40): its pages also hold fight objects. A fios load into
+			// a heap block made them foreign and the next rounds desynced (o172)
+			if (page >= (0x10090000 >> 12) && page < (0x120D0000 >> 12))
+			{
+				return;
+			}
+
 			if (!g_foreign || g_foreign[page].exchange(1))
 			{
 				return;
@@ -1704,6 +1711,98 @@ namespace rb
 		}
 	}
 
+	// File reads write through the host view (no fault): the tracking misses them and a rollback restores the buffer.
+	// RB_FILE_READ_LOG=1: reads by threads other than the main thread are logged (thread, address, size; first 400).
+	// RB_SNAP_FILE_FOREIGN_THREADS=<thread name prefixes>: whole pages covered by reads of these threads (64-byte blocks
+	// accumulated over small reads) are not rolled back. Only for the sound stream: data the game loads for the fight must
+	// stay in the snapshot (all reads excluded desynced in round 2, o172).
+	std::atomic<u32> g_file_foreign_scope = 0;
+
+	void state_file_foreign_scope(bool enter)
+	{
+		static const bool on = !std::getenv("RB_SNAP_SOUND_READS") || *std::getenv("RB_SNAP_SOUND_READS") != '0';
+
+		if (on)
+		{
+			enter ? g_file_foreign_scope++ : g_file_foreign_scope--;
+		}
+	}
+
+	void note_file_read(u32 addr, u64 size)
+	{
+		if (!g_track_active || !size)
+		{
+			return;
+		}
+
+		const auto cpu = cpu_thread::get_current();
+
+		// The main thread: only inside the sound update of a live frame (the music stream refill; o174/o175 analysis)
+		const bool main_scope = cpu && cpu->id == 0x1000000;
+
+		if (main_scope && !g_file_foreign_scope)
+		{
+			return;
+		}
+
+		// PPU threads by their guest name, host threads (asynchronous file I/O) by their host name
+		std::string name;
+
+		if (cpu && cpu->get_class() == thread_class::ppu)
+		{
+			const auto name_ptr = static_cast<ppu_thread*>(cpu)->ppu_tname.load();
+			name = name_ptr ? *name_ptr : std::string();
+		}
+		else
+		{
+			name = std::string(thread_ctrl::get_name());
+		}
+
+		static const bool log_reads = std::getenv("RB_FILE_READ_LOG") && *std::getenv("RB_FILE_READ_LOG") == '1';
+
+		if (static std::atomic<u32> logged = 0; log_reads && logged++ < 400)
+		{
+			rb_log.notice("File read by %s: 0x%08x size 0x%x", name, addr, size);
+		}
+
+		static const std::vector<std::string> prefixes = []()
+		{
+			const char* v = std::getenv("RB_SNAP_FILE_FOREIGN_THREADS");
+			return v && *v ? fmt::split(v, {","}) : std::vector<std::string>{};
+		}();
+
+		if (!g_foreign || (!main_scope && (prefixes.empty() || !std::any_of(prefixes.begin(), prefixes.end(), [&](const std::string& p) { return name.starts_with(p); }))))
+		{
+			return;
+		}
+
+		static std::mutex mutex;
+		static std::unordered_map<u32, u64> covered;
+		std::lock_guard lock(mutex);
+		const u64 begin = addr, stop = u64{addr} + size;
+
+		for (u64 page = begin >> 12; page <= (stop - 1) >> 12; page++)
+		{
+			const u64 lo = std::max(begin, page << 12), hi = std::min(stop, (page + 1) << 12);
+			const u32 b0 = static_cast<u32>(((lo & 0xfff) + 63) >> 6);
+			const u32 b1 = static_cast<u32>(hi - (page << 12)) >> 6;
+
+			if (b1 <= b0)
+			{
+				continue;
+			}
+
+			const u64 bits = (b1 - b0 >= 64 ? ~u64{0} : ((u64{1} << (b1 - b0)) - 1)) << b0;
+			u64& mask = covered[static_cast<u32>(page)];
+			mask |= bits;
+
+			if (mask == ~u64{0})
+			{
+				mark_foreign(static_cast<u32>(page), "file reads of " + name);
+			}
+		}
+	}
+
 	void state_request_rollback(u64 to_frame, std::function<void()> before, std::function<void()> after, u64 max_depth, u64 max_tag, u64 min_tag)
 	{
 		g_request_to = to_frame;
@@ -2333,11 +2432,13 @@ namespace rb
 					const auto start = std::chrono::steady_clock::now();
 					g_resim_start = start;
 					g_resim_depth = static_cast<u32>(game_frame - to);
+					online::sound_runtime_before_load();
 					film_save();
 					g_store.copy<false>(to_slot);
 					film_restore();
 					task_check(to, "after load");
 					film_undo_after_load(to);
+					online::sound_runtime_after_load();
 
 					// Snapshots after the restored frame belong to the discarded timeline (online mode saves no boundary
 					// during the re-simulation, so they would otherwise stay valid for a second rollback)
@@ -2412,11 +2513,13 @@ namespace rb
 				const auto start = std::chrono::steady_clock::now();
 				g_resim_start = wait_start;
 				g_resim_depth = static_cast<u32>(game_frame - from);
+				online::sound_runtime_before_load();
 				film_save();
 				g_store.copy<false>(from_slot);
 				film_restore();
 				task_check(from, "after load");
 				film_undo_after_load(from);
+				online::sound_runtime_after_load();
 				online::stress_sound_after_load(from);
 				const u64 us = elapsed_us(start);
 
