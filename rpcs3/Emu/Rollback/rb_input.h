@@ -98,6 +98,9 @@ namespace rb
 
 	namespace online
 	{
+		// RB_MUTE_STAGE_MUSIC (default on): an audio decoder opened before the current fight (the stage music stream) is
+		// silent during the fight (rollbacks distorted it). opened_ns = steady clock at cellAdecOpen
+		bool mute_stream(u64 opened_ns);
 		// Online mode of the game (rb_online.cpp): called at every main loop frame boundary (rollback of
 		// mispredicted remote inputs happens there); hooks of the input manager at load time
 		void on_frame(ppu_thread& ppu, u32 root);

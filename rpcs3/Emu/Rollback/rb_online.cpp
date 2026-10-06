@@ -130,6 +130,8 @@ namespace rb::online
 			return g_fight_frames >= 30;
 		}
 
+		std::atomic<u64> g_fight_start_ns{0}; // steady clock when the fight markers became stable (0 = no fight)
+
 		u32 remote_player(u32 mgr)
 		{
 			return vm::read32(mgr + 0x14) == 1 ? 2 : 1;
@@ -1990,14 +1992,38 @@ namespace rb::online
 		u8 alloc;
 		u32 gen, req, valid;
 		std::array<u8, 0x150> data;
+		// RB_SOUND_KEEP_PARAMS: the per-frame parameters the main thread sets (volume/pitch/pan/sends/pause)
+		std::array<u8, 0x40> param_block; // +0x160..+0x19f (FUN_006b20f4 / 20ec / 2104 / 2134)
+		u32 rate, pause;                  // +0x1bc sample rate, +0x1cc pause counter
+		std::array<u8, 0x100> sends;      // +0x1d0..+0x2cf (0x20 per bus, FUN_006b17a8)
+		u32 pitch_ratio;                  // +0x2d0 (FUN_006b17f4)
+	};
+
+	// nuSound2 voice state (0x48 at T+0x24014): binding to the core voice (+4 index, +8 generation), +0x20 active,
+	// parameters +0x28 volume, +0x2c pitch, +0x38..+0x47 send slot/levels/pan
+	struct nu_voice_params_t
+	{
+		u32 core_idx, core_gen, state;
+		std::array<u8, 8> vol_pitch;  // +0x28..+0x2f
+		std::array<u8, 0x10> sends;   // +0x38..+0x47
 	};
 
 	std::vector<voice_runtime_t> g_voice_rt;
+	std::vector<nu_voice_params_t> g_nu_voice;
 	bool g_voice_rt_taken = false;
 
 	bool sound_keep_runtime()
 	{
 		static const bool on = std::getenv("RB_SOUND_KEEP_RUNTIME") && *std::getenv("RB_SOUND_KEEP_RUNTIME") == '1';
+		return on;
+	}
+
+	// RB_SOUND_KEEP_PARAMS=1 (extends KEEP_RUNTIME, also enables it): a sound that plays in both timelines keeps all its
+	// parameters across a load, not only its playback progress: a rollback changes nothing about such a sound. The KeyOn
+	// handshake (+0x1a0..+0x1b4) and the callbacks are never copied (restored with the snapshot).
+	bool sound_keep_params()
+	{
+		static const bool on = std::getenv("RB_SOUND_KEEP_PARAMS") && *std::getenv("RB_SOUND_KEEP_PARAMS") == '1';
 		return on;
 	}
 
@@ -2009,12 +2035,18 @@ namespace rb::online
 		return core && n && n <= 0x400 && vm::check_addr(core, vm::page_readable | vm::page_writable, n * 0x2f0);
 	}
 
+	static u32 nu_voice_states()
+	{
+		const u32 t = vm::read32(0x00D65ABC);
+		return t && vm::check_addr(t + 0x24014, vm::page_readable | vm::page_writable, 0xC0 * 0x48) ? t + 0x24014 : 0;
+	}
+
 	void sound_runtime_before_load()
 	{
 		g_voice_rt_taken = false;
 		u32 core = 0, n = 0;
 
-		if (!sound_keep_runtime() || !core_voices(core, n))
+		if (!(sound_keep_runtime() || sound_keep_params()) || !core_voices(core, n))
 		{
 			return;
 		}
@@ -2024,12 +2056,41 @@ namespace rb::online
 		for (u32 i = 0; i < n; i++)
 		{
 			const u32 v = core + i * 0x2f0;
+			const u8* ptr = vm::get_super_ptr<u8>(v);
 			voice_runtime_t& e = g_voice_rt[i];
 			e.alloc = vm::read8(v + 0x1a0);
 			e.gen = vm::read32(v + 0x1a4);
 			e.req = vm::read32(v + 0x1a8);
 			e.valid = vm::read32(v + 0x1ac);
-			std::memcpy(e.data.data(), vm::get_super_ptr<u8>(v), 0x150);
+			std::memcpy(e.data.data(), ptr, 0x150);
+
+			if (sound_keep_params())
+			{
+				std::memcpy(e.param_block.data(), ptr + 0x160, 0x40);
+				e.rate = vm::read32(v + 0x1bc);
+				e.pause = vm::read32(v + 0x1cc);
+				std::memcpy(e.sends.data(), ptr + 0x1d0, 0x100);
+				e.pitch_ratio = vm::read32(v + 0x2d0);
+			}
+		}
+
+		g_nu_voice.clear();
+
+		if (const u32 states = sound_keep_params() ? nu_voice_states() : 0)
+		{
+			g_nu_voice.resize(0xC0);
+
+			for (u32 i = 0; i < 0xC0; i++)
+			{
+				const u32 s = states + i * 0x48;
+				const u8* ptr = vm::get_super_ptr<u8>(s);
+				nu_voice_params_t& e = g_nu_voice[i];
+				e.core_idx = vm::read32(s + 4);
+				e.core_gen = vm::read32(s + 8);
+				e.state = vm::read32(s + 0x20);
+				std::memcpy(e.vol_pitch.data(), ptr + 0x28, 8);
+				std::memcpy(e.sends.data(), ptr + 0x38, 0x10);
+			}
 		}
 
 		g_voice_rt_taken = true;
@@ -2050,7 +2111,8 @@ namespace rb::online
 			return;
 		}
 
-		u32 kept = 0, changed = 0;
+		u32 kept = 0, changed = 0, nu_kept = 0;
+		const bool params = sound_keep_params();
 
 		for (u32 i = 0; i < n; i++)
 		{
@@ -2064,7 +2126,18 @@ namespace rb::online
 
 			if (vm::read8(v + 0x1a0) && vm::read32(v + 0x1a4) == e.gen && vm::read32(v + 0x1ac) == e.valid && vm::read32(v + 0x1a8) == e.req)
 			{
-				std::memcpy(vm::get_super_ptr<u8>(v), e.data.data(), 0x150);
+				u8* ptr = vm::get_super_ptr<u8>(v);
+				std::memcpy(ptr, e.data.data(), 0x150);
+
+				if (params)
+				{
+					std::memcpy(ptr + 0x160, e.param_block.data(), 0x40);
+					vm::write32(v + 0x1bc, e.rate);
+					vm::write32(v + 0x1cc, e.pause);
+					std::memcpy(ptr + 0x1d0, e.sends.data(), 0x100);
+					vm::write32(v + 0x2d0, e.pitch_ratio);
+				}
+
 				kept++;
 			}
 			else
@@ -2073,10 +2146,28 @@ namespace rb::online
 			}
 		}
 
+		// nuSound2 voice states bound to the same core voice (index and generation) and active before and after
+		if (const u32 states = params && g_nu_voice.size() == 0xC0 ? nu_voice_states() : 0)
+		{
+			for (u32 i = 0; i < 0xC0; i++)
+			{
+				const u32 s = states + i * 0x48;
+				const nu_voice_params_t& e = g_nu_voice[i];
+
+				if (e.state == 1 && e.core_idx != umax && vm::read32(s + 0x20) == 1 && vm::read32(s + 4) == e.core_idx && vm::read32(s + 8) == e.core_gen)
+				{
+					u8* ptr = vm::get_super_ptr<u8>(s);
+					std::memcpy(ptr + 0x28, e.vol_pitch.data(), 8);
+					std::memcpy(ptr + 0x38, e.sends.data(), 0x10);
+					nu_kept++;
+				}
+			}
+		}
+
 		if (static u64 loads = 0, total_kept = 0, total_changed = 0; total_kept += kept, total_changed += changed, ++loads % 100 == 1)
 		{
-			rb_online_log.notice("Sound runtime kept across loads: this load %u voices kept, %u not (changed in the discarded frames); %u loads, %u kept, %u not in total",
-				kept, changed, loads, total_kept, total_changed);
+			rb_online_log.notice("Sound runtime kept across loads%s: this load %u voices kept (%u nuSound2 states), %u not (changed in the discarded frames); %u loads, %u kept, %u not in total",
+				params ? " with parameters" : "", kept, nu_kept, changed, loads, total_kept, total_changed);
 		}
 	}
 
@@ -2623,6 +2714,13 @@ namespace rb::online
 	bool fight_active()
 	{
 		return config().predict && in_fight() && ring_ready();
+	}
+
+	bool mute_stream(u64 opened_ns)
+	{
+		static const bool on = !std::getenv("RB_MUTE_STAGE_MUSIC") || *std::getenv("RB_MUTE_STAGE_MUSIC") != '0';
+		const u64 start = g_fight_start_ns;
+		return on && config().predict && start && opened_ns < start;
 	}
 
 	bool is_resimulating()
@@ -3469,6 +3567,15 @@ namespace rb::online
 
 		// The online fight runs: it is the sync point of the snapshot module (the offline one, the game LCG, is not used)
 		const bool fight = in_fight();
+
+		if (fight && !g_fight_start_ns)
+		{
+			g_fight_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+		}
+		else if (!fight)
+		{
+			g_fight_start_ns = 0;
+		}
 
 		if (fight)
 		{

@@ -8,6 +8,7 @@
 
 #include "cellAdec.h"
 #include "Emu/Rollback/rb_state.h"
+#include "Emu/Rollback/rb_input.h"
 #include <map>
 #include <mutex>
 
@@ -1486,6 +1487,7 @@ error_code cellAdecQueryAttr(ppu_thread& ppu, vm::ptr<CellAdecType> type, vm::pt
 
 static std::mutex rb_adec_ranges_mutex;
 static std::map<u32, std::pair<u32, u32>> rb_adec_ranges;
+static std::map<u32, u64> rb_adec_opened; // rollback: steady clock at open per instance (stage music mute)
 static constexpr u32 rb_adec_stream_window = 0x40000; // rollback: range after an instance where non-PPU writes are not rolled back
 
 error_code adecOpen(ppu_thread& ppu, vm::ptr<CellAdecType> type, vm::cptr<CellAdecResource> res, vm::cptr<CellAdecCb> cb, vm::pptr<AdecContext> handle, vm::cptr<CellAdecResourceSpurs> spursRes)
@@ -1574,6 +1576,7 @@ error_code adecOpen(ppu_thread& ppu, vm::ptr<CellAdecType> type, vm::cptr<CellAd
 	{
 		std::lock_guard lock(rb_adec_ranges_mutex);
 		rb_adec_ranges[_this.addr()] = {+res->startAddr, res->startAddr + res->totalMemSize};
+		rb_adec_opened[_this.addr()] = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 	}
 
 	rb::state_exclude_async(res->startAddr, res->startAddr + res->totalMemSize, "cellAdec instance");
@@ -2024,6 +2027,21 @@ error_code cellAdecGetPcm(ppu_thread& ppu, vm::ptr<AdecContext> handle, vm::ptr<
 	if (handle->unlink_frame(ppu, pcm_item->pcmHandle) == static_cast<s32>(CELL_ADEC_ERROR_FATAL))
 	{
 		return CELL_ADEC_ERROR_FATAL;
+	}
+
+	// Rollback fork: the stage music (a decoder opened before the fight) is silent during an online rollback fight
+	if (outBuffer)
+	{
+		u64 opened = 0;
+		{
+			std::lock_guard lock(rb_adec_ranges_mutex);
+			if (const auto it = rb_adec_opened.find(handle.addr()); it != rb_adec_opened.end()) opened = it->second;
+		}
+
+		if (opened && rb::online::mute_stream(opened) && vm::check_addr(outBuffer.addr(), vm::page_writable, pcm_item->size))
+		{
+			std::memset(vm::get_super_ptr<u8>(outBuffer.addr()), 0, pcm_item->size);
+		}
 	}
 
 	handle->reset_frame(pcm_item->pcmHandle);

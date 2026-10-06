@@ -22,6 +22,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <thread>
 #include <vector>
@@ -1548,6 +1551,54 @@ namespace rb
 
 	void state_kernel_change(const char* what, u32 addr)
 	{
+		// RB_KERNEL_IGNORE_THREADS (name prefixes, default "bnus,CnuSound,HLE ,fios,SpursHdlr,_libpngdec"): kernel objects
+		// created / destroyed by the sound, decoder and loader threads do not drop the snapshots. Their state is outside the
+		// rollback anyway; dropping the ring when a music/voice decoder ended left a misprediction found a few frames later
+		// with nothing to roll back to ("refused: no snapshot", a permanent desync, o196).
+		if (const auto cpu = cpu_thread::get_current(); cpu && cpu->get_class() == thread_class::ppu && cpu->id != 0x1000000)
+		{
+			static const std::vector<std::string> prefixes = []()
+			{
+				const char* v = std::getenv("RB_KERNEL_IGNORE_THREADS");
+				return fmt::split(v ? v : "bnus,CnuSound,HLE ,fios,SpursHdlr,_libpngdec", {","});
+			}();
+
+			const auto name_ptr = static_cast<ppu_thread*>(cpu)->ppu_tname.load();
+
+			// lwmutex / lwcond created or destroyed by any thread other than the main thread: their control structures are excluded
+			// from the snapshot (update_sync_exclusions) and the game only keeps pointers to them, so a load across the create /
+			// destroy is harmless. The trophy unlock at every KO (any_workerThread) created and destroyed one and dropped the ring:
+			// a misprediction in the last frames before the KO could not be rolled back (o197).
+			if (std::string_view{what}.starts_with("_sys_lwmutex_") || std::string_view{what}.starts_with("_sys_lwcond_"))
+			{
+				static std::mutex lw_mutex;
+				static std::set<std::string> lw_reported;
+				std::lock_guard lock(lw_mutex);
+
+				if (lw_reported.size() < 32 && lw_reported.insert(std::string(what) + (name_ptr ? *name_ptr : std::string())).second)
+				{
+					rb_log.notice("Snapshot: kernel change %s(0x%x) by %s ignored (lightweight sync object of a non-main thread)", what, addr,
+						name_ptr ? *name_ptr : std::string("?"));
+				}
+
+				return;
+			}
+
+			if (name_ptr && std::any_of(prefixes.begin(), prefixes.end(), [&](const std::string& p) { return !p.empty() && name_ptr->starts_with(p); }))
+			{
+				static std::mutex mutex;
+				static std::set<std::string> reported;
+				std::lock_guard lock(mutex);
+
+				if (reported.size() < 64 && reported.insert(what).second)
+				{
+					rb_log.notice("Snapshot: kernel change %s(0x%x) by %s ignored (thread outside the rollback)", what, addr, *name_ptr);
+				}
+
+				return;
+			}
+		}
+
 		g_kernel_changes++;
 		static std::atomic<u32> reported = 0;
 
@@ -2400,7 +2451,8 @@ namespace rb
 				{
 					if (static u32 logged = 0; logged++ < 50)
 					{
-						rb_log.error("Rollback to frame %u (remote frame %u) refused: no snapshot before that remote frame", to, g_request_max_tag);
+						rb_log.error("Rollback to frame %u (remote frame %u) refused: no snapshot before that remote frame - the misprediction stays in the simulation (desync guaranteed, %u so far)",
+							to, g_request_max_tag, g_refused_rollbacks + 1);
 					}
 
 					g_refused_rollbacks++;
@@ -2473,8 +2525,15 @@ namespace rb
 
 				if (g_request_failed++ < 50)
 				{
-					rb_log.error("Online rollback to frame %u impossible at frame %u (slot %u holds %u, valid %d)", to, game_frame, to_slot,
-						g_ring_info[to_slot].game_frame, g_ring_valid[to_slot]);
+					if (to_slot < ring_size)
+					{
+						rb_log.error("Online rollback to frame %u impossible at frame %u (slot %u holds %u, valid %d)", to, game_frame, to_slot,
+							g_ring_info[to_slot].game_frame, g_ring_valid[to_slot]);
+					}
+					else
+					{
+						rb_log.error("Online rollback to frame %u impossible at frame %u (no usable slot)", to, game_frame);
+					}
 				}
 			}
 
