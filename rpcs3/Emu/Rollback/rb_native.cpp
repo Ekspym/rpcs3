@@ -5,6 +5,7 @@
 #include "Emu/Memory/vm.h"
 
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 
 #ifdef _WIN32
@@ -107,12 +108,25 @@ namespace rb::native
 		}
 	}
 
+	// Back in the lifted code after RPCS3 ran something (syscall, firmware or HLE function): like RPCS3's own PPU code
+	// at the next block, the thread leaves the "waiting / not accessing guest memory" state (cpu_flag::wait set by a
+	// syscall or a blocking call) and serves pending suspend requests. Without this the lifted code kept running while
+	// RPCS3 considered the thread out of guest memory: SPU atomic operations and suspend_all ran concurrently with it.
+	void resume(ppu_thread& ppu)
+	{
+		if (ppu.state)
+		{
+			ppu.check_state();
+		}
+	}
+
 	// The lifted code reached an address without a lifted function: RPCS3 runs it with the same registers
 	void host_call_guest(ppu_context* ctx, u32 addr)
 	{
 		ppu_thread& ppu = *g_ppu;
 		from_ctx(*ctx, ppu);
 		ppu.fast_call(addr, ppu.gpr[2]);
+		resume(ppu);
 		to_ctx(ppu, *ctx);
 	}
 
@@ -121,6 +135,7 @@ namespace rb::native
 		ppu_thread& ppu = *g_ppu;
 		from_ctx(*ctx, ppu);
 		ppu_execute_syscall(ppu, ppu.gpr[11]);
+		resume(ppu);
 		to_ctx(ppu, *ctx);
 	}
 
@@ -205,11 +220,21 @@ namespace rb::native
 
 		ppu_thread* const prev = g_ppu;
 		g_ppu = &ppu;
+		resume(ppu);
 		ppu_context ctx;
 		to_ctx(ppu, ctx);
 
 		// A call: the callee returns to LR; the lifted function returns to its host caller
 		const bool ran = g_run(addr, &ctx) != 0;
+
+		// RB_NATIVE_DELAY_US=<us>: busy wait after every native task step (timing experiments)
+		static const u64 delay_us = std::getenv("RB_NATIVE_DELAY_US") ? std::strtoull(std::getenv("RB_NATIVE_DELAY_US"), nullptr, 10) : 0;
+
+		if (delay_us)
+		{
+			const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(delay_us);
+			while (std::chrono::steady_clock::now() < until) {}
+		}
 
 		if (ran)
 		{
