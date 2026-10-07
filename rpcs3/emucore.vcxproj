@@ -386,6 +386,7 @@
     <ClCompile Include="Emu\Cell\Modules\cellOvis.cpp" />
     <ClCompile Include="Emu\Cell\Modules\cellPad.cpp" />
     <ClCompile Include="Emu\Rollback\rb_input.cpp" />
+    <ClCompile Include="Emu\Rollback\rb_native.cpp" />
     <ClCompile Include="Emu\Rollback\rb_checksum.cpp" />
     <ClCompile Include="Emu\Rollback\rb_state.cpp" />
     <ClCompile Include="Emu\Rollback\rb_net.cpp" />

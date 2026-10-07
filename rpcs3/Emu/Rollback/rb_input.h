@@ -72,6 +72,12 @@ namespace rb
 	// a frame took on the host (snapshot cost, resimulated frames). Other threads see the real timebase.
 	u64 guest_timebase();
 
+	// Hybrid (rb_native.cpp): run the lifted C++ function at addr; false = not available, run it in RPCS3
+	namespace native
+	{
+		bool call(ppu_thread& ppu, u32 addr);
+	}
+
 	// Main loop frame pieces, used by the netplay module for re-simulated frames
 	void run_task_walk(ppu_thread& ppu, u32 root); // one frame of the game (task walk of the main loop)
 	// RB_TASK_CHECK=<game frame>: from that frame on, checks the global task list of the main loop root (diagnostics; called

@@ -2075,7 +2075,28 @@ namespace rb
 
 				ppu.gpr[3] = node;
 				ppu.gpr[4] = 1;
-				ppu.fast_call(tekken_task_step, tekken_toc);
+
+				// RB_NATIVE: the task step runs in the lifted C++ code (hybrid), otherwise in RPCS3.
+				// RB_NATIVE_EXCLUDE=<vtable>,...: these tasks stay in RPCS3 (to find a task whose lifted code diverges)
+				static const std::set<u32> native_excluded = []()
+				{
+					std::set<u32> r;
+					for (const auto& v : fmt::split(get_env("RB_NATIVE_EXCLUDE"), {","}))
+					{
+						r.insert(static_cast<u32>(std::stoul(v, nullptr, 16)));
+					}
+					return r;
+				}();
+
+				if (static std::set<u32> seen; seen.insert(task_vtable).second)
+				{
+					rb_log.notice("Native: task vtable 0x%08x first run (%s)", task_vtable, native_excluded.contains(task_vtable) ? "RPCS3" : "native");
+				}
+
+				if (native_excluded.contains(task_vtable) || !native::call(ppu, tekken_task_step))
+				{
+					ppu.fast_call(tekken_task_step, tekken_toc);
+				}
 
 				if (sound_device)
 				{
