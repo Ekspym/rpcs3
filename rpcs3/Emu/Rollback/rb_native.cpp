@@ -18,6 +18,10 @@
 LOG_CHANNEL(rb_native_log, "RbNative");
 
 extern void ppu_execute_syscall(ppu_thread& ppu, u64 code);
+extern u32 ppu_lwarx(ppu_thread& ppu, u32 addr);
+extern u64 ppu_ldarx(ppu_thread& ppu, u32 addr);
+extern bool ppu_stwcx(ppu_thread& ppu, u32 addr, u32 reg_value);
+extern bool ppu_stdcx(ppu_thread& ppu, u32 addr, u64 reg_value);
 
 // Hybrid (RB_NATIVE=<t6_native.dll>): the game's PPU code lifted to C++ by ps3recomp from the user's own EBOOT
 // (recomp_t6/hybrid) runs the frame's task steps natively; RPCS3 keeps everything else (SPU, RSX, sound, lv2,
@@ -53,7 +57,8 @@ namespace rb::native
 		void (*call_guest)(ppu_context* ctx, u32 addr);
 		void (*syscall)(ppu_context* ctx);
 		u64 (*timebase)();
-		int (*store_cond)(u32 addr, u64 expected, u64 value, u32 size); // stwcx/stdcx through RPCS3 reservations
+		u64 (*load_reserve)(u32 addr, u32 size);           // lwarx/ldarx: RPCS3's ppu_lwarx/ppu_ldarx
+		int (*store_cond)(u32 addr, u64 value, u32 size);  // stwcx/stdcx: RPCS3's ppu_stwcx/ppu_stdcx
 	};
 
 	using init_fn = int (*)(const host_api*);
@@ -153,49 +158,18 @@ namespace rb::native
 		to_ctx(ppu, *ctx);
 	}
 
-	int store_cond_locked(ppu_thread& ppu, u32 addr, u64 expected, u64 value, u32 size);
-
-	// stwcx./stdcx. of the lifted code: a compare-and-swap through RPCS3's reservation machinery (lock, reservation
-	// time stamp, notification of waiters). A plain host CAS did not move the reservation time nor wake the SPU threads
-	// that wait for a change of the line (the SPURS kernel waits for new work that way: jobs queued by the native main
-	// thread were never picked up, the loading screen waited forever).
-	int host_store_cond(u32 addr, u64 expected, u64 value, u32 size)
+	// lwarx/ldarx and stwcx./stdcx. of the lifted code go through the same functions RPCS3's own compiled PPU code
+	// calls (reservation address and time in the ppu_thread, locking, notification of waiting SPUs). A host CAS did
+	// not move the reservation time nor wake the SPURS kernel waiting for a change of the line (jobs queued by the
+	// native main thread were never picked up: the loading screen waited forever).
+	u64 host_load_reserve(u32 addr, u32 size)
 	{
-		ppu_thread& ppu = *g_ppu;
-
-		// The reservation lock needs the thread in the waiting state (like an HLE function); back afterwards
-		vm::temporary_unlock(ppu);
-		const int r = store_cond_locked(ppu, addr, expected, value, size);
-		resume(ppu);
-		return r;
+		return size == 4 ? ppu_lwarx(*g_ppu, addr) : ppu_ldarx(*g_ppu, addr);
 	}
 
-	int store_cond_locked(ppu_thread& ppu, u32 addr, u64 expected, u64 value, u32 size)
+	int host_store_cond(u32 addr, u64 value, u32 size)
 	{
-		if (size == 4)
-		{
-			return vm::reservation_op<true>(ppu, vm::ptr<be_t<u32>>(vm::cast(addr)), [&](be_t<u32>& v)
-			{
-				if (v != static_cast<u32>(expected))
-				{
-					return false;
-				}
-
-				v = static_cast<u32>(value);
-				return true;
-			}) ? 1 : 0;
-		}
-
-		return vm::reservation_op<true>(ppu, vm::ptr<be_t<u64>>(vm::cast(addr)), [&](be_t<u64>& v)
-		{
-			if (v != expected)
-			{
-				return false;
-			}
-
-			v = value;
-			return true;
-		}) ? 1 : 0;
+		return (size == 4 ? ppu_stwcx(*g_ppu, addr, static_cast<u32>(value)) : ppu_stdcx(*g_ppu, addr, value)) ? 1 : 0;
 	}
 
 	u64 host_timebase()
@@ -239,7 +213,7 @@ namespace rb::native
 				return false;
 			}
 
-			static const host_api api{vm::g_base_addr, host_call_guest, host_syscall, host_timebase, host_store_cond};
+			static const host_api api{vm::g_base_addr, host_call_guest, host_syscall, host_timebase, host_load_reserve, host_store_cond};
 			const int n = init_f(&api);
 
 			// Functions with hooks or patches (HLE replacements of the rollback modules, game patches) and

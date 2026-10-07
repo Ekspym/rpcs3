@@ -1111,8 +1111,10 @@ namespace rb
 				ppu.gpr[3] = cur;
 				ppu.gpr[4] = 1;
 
-				// Hybrid: nested task steps in the lifted code too
-				if (!native::call(ppu, tekken_task_step))
+				// Hybrid: nested task steps in the lifted code too (RB_NATIVE_SUBTASK=0: in RPCS3)
+				static const bool native_subtask = get_env("RB_NATIVE_SUBTASK") != "0";
+
+				if (!native_subtask || !native::call(ppu, tekken_task_step))
 				{
 					ppu.fast_call(tekken_task_step, tekken_toc);
 				}
