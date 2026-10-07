@@ -76,6 +76,9 @@ namespace rb
 	namespace native
 	{
 		bool call(ppu_thread& ppu, u32 addr);
+
+		// Addresses with hooks or patches: calls of these from the lifted code go to RPCS3
+		void set_hooked(const std::vector<u32>& addrs);
 	}
 
 	// Main loop frame pieces, used by the netplay module for re-simulated frames

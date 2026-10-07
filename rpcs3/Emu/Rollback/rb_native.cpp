@@ -3,6 +3,8 @@
 
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Memory/vm.h"
+#include "Emu/Memory/vm_reservation.h"
+#include "Emu/Memory/vm_ptr.h"
 
 #include <cstdlib>
 #include <vector>
@@ -51,6 +53,7 @@ namespace rb::native
 		void (*call_guest)(ppu_context* ctx, u32 addr);
 		void (*syscall)(ppu_context* ctx);
 		u64 (*timebase)();
+		int (*store_cond)(u32 addr, u64 expected, u64 value, u32 size); // stwcx/stdcx through RPCS3 reservations
 	};
 
 	using init_fn = int (*)(const host_api*);
@@ -58,6 +61,12 @@ namespace rb::native
 	using size_fn = unsigned (*)();
 
 	run_fn g_run = nullptr;
+	std::vector<u32> g_hooked;
+
+	void set_hooked(const std::vector<u32>& addrs)
+	{
+		g_hooked = addrs;
+	}
 	thread_local ppu_thread* g_ppu = nullptr;
 
 	void to_ctx(const ppu_thread& ppu, ppu_context& c)
@@ -144,6 +153,51 @@ namespace rb::native
 		to_ctx(ppu, *ctx);
 	}
 
+	int store_cond_locked(ppu_thread& ppu, u32 addr, u64 expected, u64 value, u32 size);
+
+	// stwcx./stdcx. of the lifted code: a compare-and-swap through RPCS3's reservation machinery (lock, reservation
+	// time stamp, notification of waiters). A plain host CAS did not move the reservation time nor wake the SPU threads
+	// that wait for a change of the line (the SPURS kernel waits for new work that way: jobs queued by the native main
+	// thread were never picked up, the loading screen waited forever).
+	int host_store_cond(u32 addr, u64 expected, u64 value, u32 size)
+	{
+		ppu_thread& ppu = *g_ppu;
+
+		// The reservation lock needs the thread in the waiting state (like an HLE function); back afterwards
+		vm::temporary_unlock(ppu);
+		const int r = store_cond_locked(ppu, addr, expected, value, size);
+		resume(ppu);
+		return r;
+	}
+
+	int store_cond_locked(ppu_thread& ppu, u32 addr, u64 expected, u64 value, u32 size)
+	{
+		if (size == 4)
+		{
+			return vm::reservation_op<true>(ppu, vm::ptr<be_t<u32>>(vm::cast(addr)), [&](be_t<u32>& v)
+			{
+				if (v != static_cast<u32>(expected))
+				{
+					return false;
+				}
+
+				v = static_cast<u32>(value);
+				return true;
+			}) ? 1 : 0;
+		}
+
+		return vm::reservation_op<true>(ppu, vm::ptr<be_t<u64>>(vm::cast(addr)), [&](be_t<u64>& v)
+		{
+			if (v != expected)
+			{
+				return false;
+			}
+
+			v = value;
+			return true;
+		}) ? 1 : 0;
+	}
+
 	u64 host_timebase()
 	{
 		return rb::guest_timebase();
@@ -185,15 +239,16 @@ namespace rb::native
 				return false;
 			}
 
-			static const host_api api{vm::g_base_addr, host_call_guest, host_syscall, host_timebase};
+			static const host_api api{vm::g_base_addr, host_call_guest, host_syscall, host_timebase, host_store_cond};
 			const int n = init_f(&api);
 
-			// RB_NATIVE_EXCLUDE_FN=<addr>,...: indirect calls to these functions run in RPCS3 (subtree included)
-			if (const char* ex = std::getenv("RB_NATIVE_EXCLUDE_FN"); ex && *ex)
+			// Functions with hooks or patches (HLE replacements of the rollback modules, game patches) and
+			// RB_NATIVE_EXCLUDE_FN=<addr>,...: calls to them from the lifted code run in RPCS3 (subtree included)
 			{
-				std::vector<u32> list;
+				std::vector<u32> list = g_hooked;
+				const char* ex = std::getenv("RB_NATIVE_EXCLUDE_FN");
 
-				for (const auto& v : fmt::split(ex, {","}))
+				for (const auto& v : fmt::split(ex ? ex : "", {","}))
 				{
 					list.push_back(static_cast<u32>(std::stoul(v, nullptr, 16)));
 				}
@@ -201,7 +256,7 @@ namespace rb::native
 				if (const auto excl = reinterpret_cast<void (*)(const u32*, unsigned)>(GetProcAddress(dll, "t6n_exclude")))
 				{
 					excl(list.data(), static_cast<unsigned>(list.size()));
-					rb_native_log.notice("Native: %u functions left to RPCS3 (%s)", list.size(), ex);
+					rb_native_log.notice("Native: %u functions left to RPCS3 (%u hooked)", list.size(), g_hooked.size());
 				}
 			}
 			rb_native_log.success("Native code %s loaded: %d lifted functions", path, n);

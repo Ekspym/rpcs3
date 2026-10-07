@@ -1110,7 +1110,13 @@ namespace rb
 				g_task_method_now = method;
 				ppu.gpr[3] = cur;
 				ppu.gpr[4] = 1;
-				ppu.fast_call(tekken_task_step, tekken_toc);
+
+				// Hybrid: nested task steps in the lifted code too
+				if (!native::call(ppu, tekken_task_step))
+				{
+					ppu.fast_call(tekken_task_step, tekken_toc);
+				}
+
 				g_task_method_now = outer_method;
 
 				if (sound_device)

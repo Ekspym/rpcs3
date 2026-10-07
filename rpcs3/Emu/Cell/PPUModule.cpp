@@ -2522,6 +2522,9 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 	if (!ar)
 	{
 		rb::install_static_hooks(applied);
+
+		// Hybrid: functions with a hook (HLE replacement) or a patch run in RPCS3, never in the lifted code
+		rb::native::set_hooked(applied);
 	}
 
 	// Embedded SPU elf patching
