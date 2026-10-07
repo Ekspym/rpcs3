@@ -59,6 +59,7 @@ namespace rb::native
 		u64 (*timebase)();
 		u64 (*load_reserve)(u32 addr, u32 size);           // lwarx/ldarx: RPCS3's ppu_lwarx/ppu_ldarx
 		int (*store_cond)(u32 addr, u64 value, u32 size);  // stwcx/stdcx: RPCS3's ppu_stwcx/ppu_stdcx
+		void (*check_state)();                             // polled on the lifted code's backward branches
 	};
 
 	using init_fn = int (*)(const host_api*);
@@ -66,6 +67,7 @@ namespace rb::native
 	using size_fn = unsigned (*)();
 
 	run_fn g_run = nullptr;
+	void (*g_bind)(volatile u32* state) = nullptr;
 	std::vector<u32> g_hooked;
 
 	void set_hooked(const std::vector<u32>& addrs)
@@ -172,6 +174,13 @@ namespace rb::native
 		return (size == 4 ? ppu_stwcx(*g_ppu, addr, static_cast<u32>(value)) : ppu_stdcx(*g_ppu, addr, value)) ? 1 : 0;
 	}
 
+	// A loop in the lifted code found the thread's state word set (suspend_all, pause, memory lock request): serve it
+	// like RPCS3's own PPU code does at every block
+	void host_check_state()
+	{
+		g_ppu->check_state();
+	}
+
 	u64 host_timebase()
 	{
 		return rb::guest_timebase();
@@ -200,6 +209,7 @@ namespace rb::native
 			const auto init_f = reinterpret_cast<init_fn>(GetProcAddress(dll, "t6n_init"));
 			const auto size_f = reinterpret_cast<size_fn>(GetProcAddress(dll, "t6n_context_size"));
 			g_run = reinterpret_cast<run_fn>(GetProcAddress(dll, "t6n_run"));
+			g_bind = reinterpret_cast<void (*)(volatile u32*)>(GetProcAddress(dll, "t6n_bind_thread"));
 
 			if (!init_f || !size_f || !g_run)
 			{
@@ -213,7 +223,7 @@ namespace rb::native
 				return false;
 			}
 
-			static const host_api api{vm::g_base_addr, host_call_guest, host_syscall, host_timebase, host_load_reserve, host_store_cond};
+			static const host_api api{vm::g_base_addr, host_call_guest, host_syscall, host_timebase, host_load_reserve, host_store_cond, host_check_state};
 			const int n = init_f(&api);
 
 			// Functions with hooks or patches (HLE replacements of the rollback modules, game patches) and
@@ -352,6 +362,12 @@ namespace rb::native
 
 		ppu_thread* const prev = g_ppu;
 		g_ppu = &ppu;
+
+		if (g_bind)
+		{
+			g_bind(reinterpret_cast<volatile u32*>(&ppu.state));
+		}
+
 		resume(ppu);
 		ppu_context ctx;
 		to_ctx(ppu, ctx);
