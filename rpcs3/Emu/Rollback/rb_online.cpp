@@ -847,6 +847,10 @@ namespace rb::online
 	// re-simulation did not finish at times either (job chain state of the other timeline): 2 x 200 ms in one rollback
 	// (o161: 414 / 419 ms). In a re-simulation they are waited for at most 20 ms; live frames keep the 200 ms limit.
 	std::set<u32> g_restore_cancelled_jobs;
+	// Such a job that also timed out in the re-simulation: the next launch (the frame the rollback happened in, not a
+	// re-simulated one) waited the full 200 ms and did not finish either (o189 228 ms, o209 233 ms rollbacks). Until it
+	// finishes once, every wait for it is limited to 20 ms.
+	std::set<u32> g_restore_timed_out_jobs;
 
 	void hle_spurs_job_wait(ppu_thread& ppu, u32 job)
 	{
@@ -915,6 +919,7 @@ namespace rb::online
 		{
 			// Not running (finished): later launches of this job object are waited for normally again
 			stuck_waits.erase(job);
+			g_restore_timed_out_jobs.erase(job);
 		}
 		else if (stuck_waits[job] >= 2 && vm::read16(job + 0x200) == 0)
 		{
@@ -925,7 +930,7 @@ namespace rb::online
 		if (static_cast<u32>(ppu.gpr[3]) != 0)
 		{
 			const auto start = std::chrono::steady_clock::now();
-			const u64 limit_ms = is_resimulating() && g_restore_cancelled_jobs.contains(job) ? 20 : 200;
+			const u64 limit_ms = (is_resimulating() && g_restore_cancelled_jobs.contains(job)) || g_restore_timed_out_jobs.contains(job) ? 20 : 200;
 			vm::write16(bits, 1);
 
 			while (!ppu.is_stopped())
@@ -938,12 +943,18 @@ namespace rb::online
 				if (static_cast<u32>(ppu.gpr[3]) == 0)
 				{
 					stuck_waits[job] = 0;
+					g_restore_timed_out_jobs.erase(job);
 					break;
 				}
 
 				if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(limit_ms))
 				{
 					stuck_waits[job]++;
+
+					if (g_restore_cancelled_jobs.contains(job))
+					{
+						g_restore_timed_out_jobs.insert(job);
+					}
 
 					if (static u32 logged = 0; logged++ < 50)
 					{
