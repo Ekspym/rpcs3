@@ -23,6 +23,7 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -1217,7 +1218,13 @@ namespace rb::online
 		u32 g_base = 0, g_top = 0;
 		std::map<u32, std::vector<u32>> g_free;        // chunk size -> free chunks
 		std::unordered_map<u32, u32> g_chunk_size;     // chunk (= descriptor) -> chunk size
-		u64 g_allocs = 0, g_frees = 0, g_bytes = 0;
+		u64 g_allocs = 0, g_frees = 0, g_bytes = 0, g_double_frees = 0;
+		// The side heap is outside the snapshots, the main thread is not: when the main thread frees a side block and a
+		// rollback re-simulates that frame, the block is freed a second time. Freed chunks wait 1 s (> the deepest
+		// re-simulation) before they are handed out again, and a free of a chunk that is not in use is ignored, so the
+		// second free can neither break the free lists nor release a block another thread got in the meantime.
+		std::unordered_set<u32> g_unused;              // free or waiting chunks
+		std::deque<std::pair<u32, std::chrono::steady_clock::time_point>> g_waiting;
 
 		// Diagnostics: calls per hook and thread (main / other)
 		std::atomic<u64> g_calls[9][2]{};
@@ -1237,7 +1244,7 @@ namespace rb::online
 				fmt::append(out, " %s=%u/%u", g_call_names[i], +g_calls[i][0], +g_calls[i][1]);
 			}
 
-			rb_online_log.notice("Side heap calls (main/other):%s; side blocks %u allocs %u frees", out, g_allocs, g_frees);
+			rb_online_log.notice("Side heap calls (main/other):%s; side blocks %u allocs %u frees, %u repeated frees ignored", out, g_allocs, g_frees, g_double_frees);
 		}
 
 		bool enabled()
@@ -1289,10 +1296,17 @@ namespace rb::online
 
 			u32 chunk = 0;
 
+			for (const auto now = std::chrono::steady_clock::now(); !g_waiting.empty() && now - g_waiting.front().second > std::chrono::seconds(1);)
+			{
+				g_free[g_chunk_size[g_waiting.front().first]].push_back(g_waiting.front().first);
+				g_waiting.pop_front();
+			}
+
 			if (auto& list = g_free[chunk_size]; !list.empty())
 			{
 				chunk = list.back();
 				list.pop_back();
+				g_unused.erase(chunk);
 			}
 			else if (g_top + chunk_size <= g_base + region_size)
 			{
@@ -1341,7 +1355,13 @@ namespace rb::online
 				return;
 			}
 
-			g_free[found->second].push_back(desc);
+			if (!g_unused.insert(desc).second)
+			{
+				g_double_frees++;
+				return;
+			}
+
+			g_waiting.emplace_back(desc, std::chrono::steady_clock::now());
 			g_frees++;
 			g_bytes -= found->second;
 		}
@@ -1374,6 +1394,12 @@ namespace rb::online
 
 		void drop(u32 desc)
 		{
+			if (std::lock_guard lock(g_mutex); g_unused.contains(desc))
+			{
+				g_double_frees++;
+				return;
+			}
+
 			if (const u32 shared = vm::read32(desc + 0x14))
 			{
 				vm::write32(desc + 0x14, shared - 1);
@@ -3861,7 +3887,16 @@ namespace rb::online
 					// rollback (the user's choice: delay 1 up to ~100 ms ping)
 					const s32 p50 = deficits[150];
 					const s32 p90 = deficits[270];
-					const s32 window = static_cast<s32>(cfg.max_predict);
+					// Compared with the rollback depth the delay is meant to keep (the user: rollback up to ~100 ms ping = 3
+					// frames, above that only a higher delay; RB_ONLINE_AUTO_DEPTH), not with the prediction window (5 in
+					// play_online.bat: the delay rose only at ~200 ms and rollbacks went 5 frames deep). The window stays the
+					// reserve for jitter.
+					static const s32 depth = []()
+					{
+						const char* v = std::getenv("RB_ONLINE_AUTO_DEPTH");
+						return v && *v ? std::max(1, std::atoi(v)) : 3;
+					}();
+					const s32 window = std::min(depth, static_cast<s32>(cfg.max_predict));
 					const s32 old = auto_lead;
 
 					if (p50 > window)
@@ -3881,7 +3916,7 @@ namespace rb::online
 
 					if (auto_lead != old)
 					{
-						rb_online_log.success("Online: input deficit median %d / 90th percentile %d, prediction window %d: input delay %d -> %d", p50, p90, window, old, auto_lead);
+						rb_online_log.success("Online: input deficit median %d / 90th percentile %d, target rollback depth %d: input delay %d -> %d", p50, p90, window, old, auto_lead);
 					}
 
 					deficits.clear();
