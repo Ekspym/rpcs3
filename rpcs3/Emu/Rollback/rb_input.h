@@ -79,6 +79,9 @@ namespace rb
 
 		// Addresses with hooks or patches: calls of these from the lifted code go to RPCS3
 		void set_hooked(const std::vector<u32>& addrs);
+
+		// Profiling gate of the DLL sampler (T6N_SAMPLE=resim): on during a rollback + re-simulation
+		void sample_gate(bool on);
 	}
 
 	// Main loop frame pieces, used by the netplay module for re-simulated frames

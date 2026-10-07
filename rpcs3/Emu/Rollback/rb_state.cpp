@@ -2370,6 +2370,7 @@ namespace rb
 			{
 				const u64 us = elapsed_us(g_resim_start);
 				g_resim_start = {};
+				native::sample_gate(false);
 				g_resim_us_total += us;
 				g_resim_us_max = std::max(g_resim_us_max, us);
 				g_resims++;
@@ -2483,6 +2484,7 @@ namespace rb
 
 					const auto start = std::chrono::steady_clock::now();
 					g_resim_start = start;
+					native::sample_gate(true);
 					g_resim_depth = static_cast<u32>(game_frame - to);
 					online::sound_runtime_before_load();
 					film_save();
@@ -2571,6 +2573,7 @@ namespace rb
 
 				const auto start = std::chrono::steady_clock::now();
 				g_resim_start = wait_start;
+				native::sample_gate(true);
 				g_resim_depth = static_cast<u32>(game_frame - from);
 				online::sound_runtime_before_load();
 				film_save();

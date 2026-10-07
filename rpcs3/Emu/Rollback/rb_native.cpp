@@ -10,6 +10,7 @@
 #include <vector>
 #include <chrono>
 #include <cstring>
+#include <immintrin.h>
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -67,6 +68,15 @@ namespace rb::native
 	using size_fn = unsigned (*)();
 
 	run_fn g_run = nullptr;
+	volatile long* g_sample_gate = nullptr;
+
+	void sample_gate(bool on)
+	{
+		if (g_sample_gate)
+		{
+			*g_sample_gate = on ? 1 : 0;
+		}
+	}
 	void (*g_bind)(volatile u32* state) = nullptr;
 	std::vector<u32> g_hooked;
 
@@ -76,18 +86,20 @@ namespace rb::native
 	}
 	thread_local ppu_thread* g_ppu = nullptr;
 
+	inline __m128i reverse16(__m128i v)
+	{
+		return _mm_shuffle_epi8(v, _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0));
+	}
+
 	void to_ctx(const ppu_thread& ppu, ppu_context& c)
 	{
 		std::memcpy(c.gpr, ppu.gpr, sizeof(c.gpr));
 		std::memcpy(c.fpr, ppu.fpr, sizeof(c.fpr));
 
-		// RPCS3 keeps vector registers byte-reversed (element 0 in the high bytes)
+		// RPCS3 keeps vector registers byte-reversed (element 0 in the high bytes): reverse all 16 bytes
 		for (u32 i = 0; i < 32; i++)
 		{
-			for (u32 b = 0; b < 16; b++)
-			{
-				c.vr[i][b] = ppu.vr[i]._u8[15 - b];
-			}
+			_mm_storeu_si128(reinterpret_cast<__m128i*>(c.vr[i]), reverse16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(&ppu.vr[i]))));
 		}
 
 		c.cr = ppu.cr.pack();
@@ -107,10 +119,7 @@ namespace rb::native
 
 		for (u32 i = 0; i < 32; i++)
 		{
-			for (u32 b = 0; b < 16; b++)
-			{
-				ppu.vr[i]._u8[15 - b] = c.vr[i][b];
-			}
+			_mm_storeu_si128(reinterpret_cast<__m128i*>(&ppu.vr[i]), reverse16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c.vr[i]))));
 		}
 
 		ppu.cr.unpack(c.cr);
@@ -210,6 +219,7 @@ namespace rb::native
 			const auto size_f = reinterpret_cast<size_fn>(GetProcAddress(dll, "t6n_context_size"));
 			g_run = reinterpret_cast<run_fn>(GetProcAddress(dll, "t6n_run"));
 			g_bind = reinterpret_cast<void (*)(volatile u32*)>(GetProcAddress(dll, "t6n_bind_thread"));
+			g_sample_gate = reinterpret_cast<volatile long*>(GetProcAddress(dll, "t6n_sample_gate"));
 
 			if (!init_f || !size_f || !g_run)
 			{
