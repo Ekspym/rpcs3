@@ -405,7 +405,55 @@ namespace rb
 		}
 	}
 
+	void on_pad_get_data_impl(u32 port_no, CellPadData* data);
+
+	// Hybrid frame differential (rb_native.cpp): a frame runs twice from the same state; the second run must read the
+	// same controller data as the first (scripted commands are consumed per read)
+	namespace native
+	{
+		int g_pad_mode = 0; // 1 = record the reads, 2 = replay them
+		std::vector<std::pair<u32, CellPadData>> g_pad_reads;
+		usz g_pad_pos = 0;
+
+		void pad_record()
+		{
+			g_pad_mode = 1;
+			g_pad_reads.clear();
+		}
+
+		void pad_replay()
+		{
+			g_pad_mode = 2;
+			g_pad_pos = 0;
+		}
+
+		void pad_off()
+		{
+			g_pad_mode = 0;
+		}
+	}
+
 	void on_pad_get_data(u32 port_no, CellPadData* data)
+	{
+		if (native::g_pad_mode == 2)
+		{
+			if (native::g_pad_pos < native::g_pad_reads.size())
+			{
+				std::memcpy(data, &native::g_pad_reads[native::g_pad_pos++].second, sizeof(CellPadData));
+			}
+
+			return;
+		}
+
+		on_pad_get_data_impl(port_no, data);
+
+		if (native::g_pad_mode == 1)
+		{
+			native::g_pad_reads.emplace_back(port_no, *data);
+		}
+	}
+
+	void on_pad_get_data_impl(u32 port_no, CellPadData* data)
 	{
 		ensure_init();
 

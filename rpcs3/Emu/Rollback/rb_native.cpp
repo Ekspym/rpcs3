@@ -5,6 +5,7 @@
 #include "Emu/Memory/vm.h"
 
 #include <cstdlib>
+#include <vector>
 #include <chrono>
 #include <cstring>
 
@@ -21,6 +22,10 @@ extern void ppu_execute_syscall(ppu_thread& ppu, u64 code);
 // firmware libraries) and runs whatever the lifted code calls that has no lifted function.
 namespace rb::native
 {
+	void pad_record();
+	void pad_replay();
+	void pad_off();
+
 	// Must match ppu_context of ps3recomp's lifted code (ppu_recomp.h) field by field
 	struct ppu_context
 	{
@@ -209,6 +214,104 @@ namespace rb::native
 		return ok;
 	}
 
+
+	// RB_NATIVE_DIFF_AFTER_S=<s>: from that many seconds after the native code was loaded, every frame runs twice from
+	// the same state - lifted code, then RPCS3 - and the game's data and heaps are compared (through the unprotected
+	// view, so RSX page protection is not triggered); differing words are logged, RPCS3's result is kept.
+	struct diff_state
+	{
+		bool on = false;
+		std::chrono::steady_clock::time_point start{};
+		u64 after_s = 0;
+		u32 frames = 0;
+		u32 reported = 0;
+	};
+
+	diff_state g_diff;
+
+	u32 bswap32(u32 v)
+	{
+		return (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24);
+	}
+
+	// Game data and heaps; not the RSX command buffers / draw request buffers (0x30000000-0x36000000) and not the draw
+	// manager (0x00D2C000-0x00D2E000): restoring those desynchronised the RSX
+	constexpr u32 diff_ranges[][2] = {{0x00900000u, 0x00D2C000u}, {0x00D2E000u, 0x00D80000u}, {0x10000000u, 0x14000000u}, {0x36000000u, 0x37600000u}};
+
+	void diff_copy(std::vector<u8>& out)
+	{
+		out.clear();
+
+		for (const auto& r : diff_ranges)
+		{
+			for (u32 page = r[0]; page < r[1]; page += 4096)
+			{
+				const usz at = out.size();
+				out.resize(at + 4096);
+
+				if (vm::check_addr(page))
+				{
+					std::memcpy(out.data() + at, vm::g_sudo_addr + page, 4096);
+				}
+				else
+				{
+					std::memset(out.data() + at, 0, 4096);
+				}
+			}
+		}
+	}
+
+	void diff_restore(const std::vector<u8>& in)
+	{
+		usz at = 0;
+
+		for (const auto& r : diff_ranges)
+		{
+			for (u32 page = r[0]; page < r[1]; page += 4096, at += 4096)
+			{
+				if (vm::check_addr(page, vm::page_writable))
+				{
+					std::memcpy(vm::g_sudo_addr + page, in.data() + at, 4096);
+				}
+			}
+		}
+	}
+
+	u32 diff_addr(usz offset)
+	{
+		for (const auto& r : diff_ranges)
+		{
+			const usz size = r[1] - r[0];
+
+			if (offset < size)
+			{
+				return r[0] + static_cast<u32>(offset);
+			}
+
+			offset -= size;
+		}
+
+		return 0;
+	}
+
+	bool diff_active()
+	{
+		static const bool init = []()
+		{
+			if (const char* v = std::getenv("RB_NATIVE_DIFF_AFTER_S"); v && *v)
+			{
+				g_diff.on = true;
+				g_diff.after_s = std::strtoull(v, nullptr, 10);
+				g_diff.start = std::chrono::steady_clock::now();
+			}
+
+			return true;
+		}();
+
+		(void)init;
+		return g_diff.on && std::chrono::steady_clock::now() - g_diff.start > std::chrono::seconds(g_diff.after_s);
+	}
+
 	// Runs the lifted function at addr on this PPU thread's registers; false when native code is off or has no such
 	// function (the caller runs it in RPCS3)
 	bool call(ppu_thread& ppu, u32 addr)
@@ -223,6 +326,73 @@ namespace rb::native
 		resume(ppu);
 		ppu_context ctx;
 		to_ctx(ppu, ctx);
+
+		if (diff_active() && g_diff.reported < 20)
+		{
+			if (g_diff.frames == 0)
+			{
+				rb_native_log.success("Diff: native vs RPCS3 frame comparison started");
+			}
+
+			static std::vector<u8> before, native_after, rpcs3_after;
+			diff_copy(before);
+			const ppu_context regs_in = ctx;
+
+			pad_record();
+
+			if (!g_run(addr, &ctx))
+			{
+				pad_off();
+				g_ppu = prev;
+				return false;
+			}
+
+			diff_copy(native_after);
+			const ppu_context regs_native = ctx;
+
+			// Same frame in RPCS3 from the same state
+			diff_restore(before);
+			from_ctx(regs_in, ppu);
+			pad_replay();
+			ppu.fast_call(addr, 0x0096A8B0);
+			resume(ppu);
+			pad_off();
+			diff_copy(rpcs3_after);
+			g_diff.frames++;
+
+			// Words both runs wrote differently (other threads' writes during either run show up too: noise)
+			u32 shown = 0;
+
+			for (usz i = 0; i + 4 <= rpcs3_after.size(); i += 4)
+			{
+				if (std::memcmp(native_after.data() + i, rpcs3_after.data() + i, 4) != 0 &&
+					(std::memcmp(native_after.data() + i, before.data() + i, 4) != 0 || std::memcmp(rpcs3_after.data() + i, before.data() + i, 4) != 0))
+				{
+					if (shown++ < 40)
+					{
+						u32 b, n, r;
+						std::memcpy(&b, before.data() + i, 4);
+						std::memcpy(&n, native_after.data() + i, 4);
+						std::memcpy(&r, rpcs3_after.data() + i, 4);
+						rb_native_log.warning("Diff frame %u: 0x%08x before %08x native %08x rpcs3 %08x", g_diff.frames, diff_addr(i),
+							bswap32(b), bswap32(n), bswap32(r));
+					}
+				}
+			}
+
+			if (shown)
+			{
+				g_diff.reported++;
+				rb_native_log.warning("Diff frame %u: %u differing words (r3 native %x rpcs3 %x)", g_diff.frames, shown, regs_native.gpr[3], ppu.gpr[3]);
+			}
+			else if (g_diff.frames % 60 == 0)
+			{
+				rb_native_log.notice("Diff: %u frames identical so far", g_diff.frames);
+			}
+
+			g_ppu = prev;
+			return true;
+		}
 
 		// A call: the callee returns to LR; the lifted function returns to its host caller
 		const bool ran = g_run(addr, &ctx) != 0;
