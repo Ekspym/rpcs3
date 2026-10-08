@@ -65,7 +65,7 @@ namespace rb::native
 		u64 (*load_reserve)(u32 addr, u32 size);           // lwarx/ldarx: RPCS3's ppu_lwarx/ppu_ldarx
 		int (*store_cond)(u32 addr, u64 value, u32 size);  // stwcx/stdcx: RPCS3's ppu_stwcx/ppu_stdcx
 		void (*check_state)();                             // polled on the lifted code's backward branches
-		void (*sound_frame)(u64* frame, int* resim, int* active); // sound boundary (RB_SOUND_SEPARATE)
+		void (*sound_frame)(u64* frame, u64* loads, int* resim, int* active); // sound boundary (RB_SOUND_SEPARATE)
 		int (*addr_saved)(u32 addr);                       // rb::state_addr_saved: 2 = excluded from the snapshots
 	};
 
@@ -196,10 +196,10 @@ namespace rb::native
 		g_ppu->check_state();
 	}
 
-	void host_sound_frame(u64* frame, int* resim, int* active)
+	void host_sound_frame(u64* frame, u64* loads, int* resim, int* active)
 	{
 		bool r = false, a = false;
-		online::sound_boundary_state(*frame, r, a);
+		online::sound_boundary_state(*frame, *loads, r, a);
 		*resim = r;
 		*active = a;
 	}

@@ -31,6 +31,9 @@ namespace rb
 	// rollback happened); RB_FAST_RESIM runs them without rendering
 	bool state_resimulating(u64 game_frame);
 
+	// Snapshot loads so far (online, stress and netplay rollbacks)
+	u64 state_load_count();
+
 	// Write tracking of the calibrated pages (RB_SNAP_TRACK=1). on_write_fault is called by the access violation
 	// handler: true when the page was a tracked clean page (now dirty and writable). note_write is called by the
 	// RPCS3 paths that write guest memory through the unprotected view (128-byte atomic stores, reservations).

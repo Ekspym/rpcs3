@@ -1638,9 +1638,22 @@ namespace rb::online
 	u64 g_snd_ok = 0, g_snd_fail = 0, g_snd_claimed = 0, g_snd_stopped = 0;
 	u64 g_snd_skipped = 0; // re-simulated PLAYs not started (RB_SOUND_SIMPLE)
 
+	// RB_SOUND_SEPARATE=1 (hybrid): the sound library is outside the rollback and the DLL's sound boundary replays the
+	// library calls of re-simulated frames. The bookkeeping that guessed which sounds belonged to a discarded timeline
+	// (stop after the re-simulation, leak cleanup) is off: it saw no PLAY in the re-simulation and cut correct sounds (o243:
+	// 278 "discarded" stops). Sounds play on as if there was no rollback.
+	bool sound_separate()
+	{
+		static const bool on = std::getenv("RB_SOUND_SEPARATE") && *std::getenv("RB_SOUND_SEPARATE") == '1';
+		return on;
+	}
+
 	bool sound_simple()
 	{
-		static const bool on = !std::getenv("RB_SOUND_SIMPLE") || *std::getenv("RB_SOUND_SIMPLE") != '0';
+		// With RB_SOUND_SEPARATE the hybrid's sound boundary replays the calls of a re-simulated frame; a PLAY that still
+		// reaches the library there belongs to the corrected timeline and must sound: default off then
+		static const bool separate = std::getenv("RB_SOUND_SEPARATE") && *std::getenv("RB_SOUND_SEPARATE") == '1';
+		static const bool on = std::getenv("RB_SOUND_SIMPLE") ? *std::getenv("RB_SOUND_SIMPLE") != '0' : !separate;
 		return on;
 	}
 	std::map<s32, u64> g_snd_fail_codes;
@@ -2352,7 +2365,7 @@ namespace rb::online
 					}
 				}
 
-				if (!sound_simple() && it->frame >= g_sound_resim_first && it->frame < seq[0] && !it->claimed && !it->cosmetic && !held)
+				if (!sound_simple() && !sound_separate() && it->frame >= g_sound_resim_first && it->frame < seq[0] && !it->claimed && !it->cosmetic && !held)
 				{
 					auto& ppu = *get_current_cpu_thread<ppu_thread>();
 					const u32 old_r1 = static_cast<u32>(ppu.gpr[1]);
@@ -2495,7 +2508,7 @@ namespace rb::online
 		// (handle -1) is a voice nobody can stop any more: stopped (not when the field was reused for something else). Short sounds end on their own before that.
 		// Only sounds covered by a load (p.rolled): a -1 the game wrote itself (sound done, field reset or reused) is not a leak;
 		// stopping those (~500 per fight, 70 % of all starts) cut long sounds such as the stage music.
-		if (!resim && seq[0] % 30 == 0)
+		if (!resim && !sound_separate() && seq[0] % 30 == 0)
 		{
 			u32 cleaned = 0;
 
@@ -2823,7 +2836,8 @@ namespace rb::online
 
 	bool mute_stream(u64 opened_ns)
 	{
-		static const bool on = !std::getenv("RB_MUTE_STAGE_MUSIC") || *std::getenv("RB_MUTE_STAGE_MUSIC") != '0';
+		// With RB_SOUND_SEPARATE the music stream is not rolled back: not muted by default
+		static const bool on = std::getenv("RB_MUTE_STAGE_MUSIC") ? *std::getenv("RB_MUTE_STAGE_MUSIC") != '0' : !sound_separate();
 		const u64 start = g_fight_start_ns;
 		return on && config().predict && start && opened_ns < start;
 	}
@@ -4455,10 +4469,11 @@ namespace rb::online
 		}
 	}
 
-	void sound_boundary_state(u64& frame, bool& resim, bool& active)
+	void sound_boundary_state(u64& frame, u64& loads, bool& resim, bool& active)
 	{
 		static const bool on = std::getenv("RB_SOUND_SEPARATE") && *std::getenv("RB_SOUND_SEPARATE") == '1';
 		frame = sound_frame_no();
+		loads = state_load_count();
 		resim = sound_resim();
 		active = on && sound_recording_active();
 	}

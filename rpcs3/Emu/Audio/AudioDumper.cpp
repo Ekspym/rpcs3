@@ -48,6 +48,9 @@ void AudioDumper::Close()
 	}
 }
 
+// Sample frames written to the dump (rollback analysis: RB_ROLLBACK_CSV)
+std::atomic<u64> g_audio_dump_frames{0};
+
 void AudioDumper::WriteData(const void* buffer, u32 size)
 {
 	if (GetCh() && size && buffer)
@@ -56,6 +59,7 @@ void AudioDumper::WriteData(const void* buffer, u32 size)
 		const u32 sample_cnt_per_ch = size / blk_size;
 
 		ensure(size - sample_cnt_per_ch * blk_size == 0);
+		g_audio_dump_frames += sample_cnt_per_ch;
 
 		if constexpr (std::endian::big == std::endian::native)
 		{

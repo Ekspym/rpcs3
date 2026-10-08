@@ -31,6 +31,8 @@
 
 LOG_CHANNEL(rb_log, "Rollback");
 
+extern std::atomic<u64> g_audio_dump_frames; // AudioDumper.cpp
+
 namespace rb
 {
 	namespace
@@ -1530,6 +1532,24 @@ namespace rb
 		}
 	}
 
+	void rollback_csv(const std::string& line)
+	{
+		static const char* path = std::getenv("RB_ROLLBACK_CSV");
+
+		if (!path || !*path)
+		{
+			return;
+		}
+
+		static fs::file f(fmt::format("%s_%u.csv", path, static_cast<u32>(std::chrono::steady_clock::now().time_since_epoch().count() & 0xffff)), fs::rewrite);
+		f.write(fmt::format("%s,%u\n", line, ::g_audio_dump_frames.load()));
+	}
+
+	u64 state_load_count()
+	{
+		return g_rollbacks;
+	}
+
 	int state_addr_saved(u32 addr)
 	{
 		for (const auto* list : {&g_excluded, &g_sync_excluded})
@@ -2369,6 +2389,7 @@ namespace rb
 			if (g_resim_start.time_since_epoch().count() && game_frame == g_last_rollback_from)
 			{
 				const u64 us = elapsed_us(g_resim_start);
+				rollback_csv(fmt::format("E,%u", us));
 				g_resim_start = {};
 				native::sample_gate(false);
 				g_resim_us_total += us;
@@ -2514,6 +2535,8 @@ namespace rb
 					{
 						g_request_after();
 					}
+
+					rollback_csv(fmt::format("R,%u,%u,%u", g_rollbacks, game_frame, to));
 
 					if (g_rollbacks % 100 == 1)
 					{
