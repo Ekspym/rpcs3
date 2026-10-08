@@ -1,10 +1,14 @@
 #include "stdafx.h"
 #include "rb_input.h"
+#include "rb_state.h"
 
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/Memory/vm_reservation.h"
 #include "Emu/Memory/vm_ptr.h"
+#include "Emu/Cell/lv2/sys_prx.h"
+#include "Emu/IdManager.h"
+#include "Utilities/File.h"
 
 #include <cstdlib>
 #include <vector>
@@ -61,6 +65,8 @@ namespace rb::native
 		u64 (*load_reserve)(u32 addr, u32 size);           // lwarx/ldarx: RPCS3's ppu_lwarx/ppu_ldarx
 		int (*store_cond)(u32 addr, u64 value, u32 size);  // stwcx/stdcx: RPCS3's ppu_stwcx/ppu_stdcx
 		void (*check_state)();                             // polled on the lifted code's backward branches
+		void (*sound_frame)(u64* frame, int* resim, int* active); // sound boundary (RB_SOUND_SEPARATE)
+		int (*addr_saved)(u32 addr);                       // rb::state_addr_saved: 2 = excluded from the snapshots
 	};
 
 	using init_fn = int (*)(const host_api*);
@@ -190,6 +196,19 @@ namespace rb::native
 		g_ppu->check_state();
 	}
 
+	void host_sound_frame(u64* frame, int* resim, int* active)
+	{
+		bool r = false, a = false;
+		online::sound_boundary_state(*frame, r, a);
+		*resim = r;
+		*active = a;
+	}
+
+	int host_addr_saved(u32 addr)
+	{
+		return rb::state_addr_saved(addr);
+	}
+
 	u64 host_timebase()
 	{
 		return rb::guest_timebase();
@@ -233,7 +252,7 @@ namespace rb::native
 				return false;
 			}
 
-			static const host_api api{vm::g_base_addr, host_call_guest, host_syscall, host_timebase, host_load_reserve, host_store_cond, host_check_state};
+			static const host_api api{vm::g_base_addr, host_call_guest, host_syscall, host_timebase, host_load_reserve, host_store_cond, host_check_state, host_sound_frame, host_addr_saved};
 			const int n = init_f(&api);
 
 			// Functions with hooks or patches (HLE replacements of the rollback modules, game patches) and
@@ -361,6 +380,54 @@ namespace rb::native
 		return g_diff.on && std::chrono::steady_clock::now() - g_diff.start > std::chrono::seconds(g_diff.after_s);
 	}
 
+	// RB_DUMP_PRX=<dir>: the loaded PRX modules (firmware LLE) as RPCS3 placed and relocated them, for lifting them into
+	// the DLL: <name>_<addr>.bin per executable segment and prx_modules.json (segments, RPCS3's function list with TOC)
+	void dump_modules()
+	{
+		static bool done = false;
+		const char* dir = std::getenv("RB_DUMP_PRX");
+
+		if (done || !dir || !*dir)
+		{
+			return;
+		}
+
+		done = true;
+		std::string json = "[\n";
+		bool first = true;
+
+		idm::select<lv2_obj, lv2_prx>([&](u32 id, lv2_prx& prx)
+		{
+			fmt::append(json, "%s {\"name\": \"%s\", \"id\": %u, \"segs\": [", first ? "" : ",\n", prx.name, id);
+			first = false;
+
+			for (usz i = 0; i < prx.segs.size(); i++)
+			{
+				const auto& seg = prx.segs[i];
+				fmt::append(json, "%s{\"addr\": %u, \"size\": %u, \"flags\": %u}", i ? ", " : "", seg.addr, seg.size, seg.flags);
+
+				if ((seg.flags & 1) && seg.size && vm::check_addr(seg.addr))
+				{
+					fs::write_file(fmt::format("%s/%s_%08x.bin", dir, prx.name, seg.addr), fs::rewrite, vm::g_sudo_addr + seg.addr, seg.size);
+				}
+			}
+
+			json += "], \"funcs\": [";
+
+			for (usz i = 0; i < prx.funcs.size(); i++)
+			{
+				const auto& f = prx.funcs[i];
+				fmt::append(json, "%s[%u, %u, %u]", i ? ", " : "", f.addr, f.size, f.toc);
+			}
+
+			json += "]}";
+		});
+
+		json += "\n]\n";
+		fs::write_file(std::string(dir) + "/prx_modules.json", fs::rewrite, json);
+		rb_native_log.success("Dumped the loaded PRX modules to %s", dir);
+	}
+
 	// Runs the lifted function at addr on this PPU thread's registers; false when native code is off or has no such
 	// function (the caller runs it in RPCS3)
 	bool call(ppu_thread& ppu, u32 addr)
@@ -368,6 +435,62 @@ namespace rb::native
 		if (!init())
 		{
 			return false;
+		}
+
+		dump_modules();
+
+		if (static u32 steps = 0; ++steps % 3600 == 0)
+		{
+			const u32 m = vm::read32(0x00B02A74);
+
+			if (m && vm::check_addr(m))
+			{
+				rb_native_log.notice("libc mspace 0x%08x: least_addr 0x%08x, top 0x%08x, topsize 0x%x", m, vm::read32(m + 0x10), vm::read32(m + 0x18), vm::read32(m + 0xc));
+			}
+
+			// Sound library structures (ANALYZA.md 14, analysis_sound_rollback_distortion.md)
+			const u32 s_ptr = vm::read32(0x0097078c);
+			const u32 s_mgr = s_ptr ? u32{vm::read32(s_ptr)} : 0u;
+			const u32 t = vm::read32(0x00D65ABC);
+			constexpr u32 g = 0x00D66D60;
+			// Pointers to the unknown sound-only blocks (page map: 0x36ECD710, 0x373FDA80-0x373FDCD0) from the library statics,
+			// S, T and the core voice header
+			if (static bool scanned = false; !scanned && s_mgr)
+			{
+				scanned = true;
+				const auto scan = [&](const char* what, u32 from, u32 to)
+				{
+					for (u32 a = from; a + 4 <= to; a += 4)
+					{
+						const u32 v = vm::read32(a);
+						if ((v >= 0x36ECD000 && v < 0x36ECE000) || (v >= 0x373FD000 && v < 0x373FE000))
+						{
+							rb_native_log.notice("Sound pointer scan: %s +0x%x (0x%08x) -> 0x%08x", what, a - from, a, v);
+						}
+					}
+				};
+				scan("statics", 0x00D64000, 0x00D67000);
+				scan("S", s_mgr, s_mgr + 0x2000);
+				scan("T", t, t + 0x24014);
+				scan("g", 0x00D66D60, 0x00D66F00);
+				scan("data 9C8", 0x009C8000, 0x009C9000);
+
+				// All pointer fields of the bnusCore global (heap blocks of the mixer)
+				for (u32 off = 0; off < 0x200; off += 4)
+				{
+					const u32 v = vm::read32(0x00D66D60 + off);
+
+					if (v >= 0x10000000 && v < 0x40000000)
+					{
+						const u32 desc = vm::check_addr(v - 4) ? u32{vm::read32(v - 4)} : 0u;
+						const u32 size = desc && vm::check_addr(desc, vm::page_readable, 0x10) && vm::read32(desc + 4) == v ? u32{vm::read32(desc + 0xc)} : 0u;
+						rb_native_log.notice("bnusCore g+0x%x = 0x%08x (block size 0x%x)", off, v, size);
+					}
+				}
+			}
+
+			rb_native_log.notice("Sound: manager S 0x%08x (banks 0x%08x, voices 0x%08x), group T 0x%08x, core voices 0x%08x x %u, list 0x%08x x %u",
+				s_mgr, s_mgr ? u32{vm::read32(s_mgr + 0x1c38)} : 0u, s_mgr ? u32{vm::read32(s_mgr + 0x1c3c)} : 0u, t, vm::read32(g + 0xc0), vm::read32(g + 0x80), vm::read32(g + 0xd8), vm::read32(g + 0xd0));
 		}
 
 		ppu_thread* const prev = g_ppu;

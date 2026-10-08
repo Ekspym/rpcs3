@@ -125,5 +125,7 @@ namespace rb
 		void stress_sound_after_load(u64 target); // RB_STRESS_SOUND: sound bookkeeping after an offline stress load
 		void sound_runtime_before_load(); // RB_SOUND_KEEP_RUNTIME: playback runtime of the sound core voices around a load
 		void sound_runtime_after_load();
+		// Sound boundary of the hybrid (RB_SOUND_SEPARATE): frame of the sound code, re-simulation, boundary active
+		void sound_boundary_state(u64& frame, bool& resim, bool& active);
 	}
 }

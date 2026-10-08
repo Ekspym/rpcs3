@@ -3510,6 +3510,111 @@ namespace rb::online
 			}
 		}
 
+		// RB_SOUND_SEPARATE=1: the rest of the sound library outside the rollback as one unit (statics, group T, core voices,
+		// side blocks, the libc mspace of the sound/network threads); see recomp_t6/fix_separate.py
+		if (std::getenv("RB_ONLINE_SOUND_ROLLBACK") == nullptr && std::getenv("RB_SOUND_SEPARATE") && *std::getenv("RB_SOUND_SEPARATE") == '1')
+		{
+			static std::set<u64> done;
+			const auto exclude_once = [](u32 from, u32 to, const char* what)
+			{
+				if (from && to > from && vm::check_addr(from, vm::page_readable) && done.insert((u64{from} << 32) | to).second)
+				{
+					state_exclude(from, to, what);
+					rb_online_log.success("Sound separate: %s 0x%08x-0x%08x outside the rollback", what, from, to);
+				}
+			};
+
+			// Size of a heap block from its descriptor (raw blocks: descriptor at data - 4, desc+4 = data, desc+0xc = size)
+			const auto block_end = [](u32 data, u32 fallback) -> u32
+			{
+				if (!vm::check_addr(data - 4, vm::page_readable))
+				{
+					return data + fallback;
+				}
+
+				const u32 desc = vm::read32(data - 4);
+
+				if (desc && vm::check_addr(desc, vm::page_readable, 0x10) && vm::read32(desc + 4) == data)
+				{
+					const u32 size = vm::read32(desc + 0xc);
+
+					if (size && size <= 0x100000)
+					{
+						return data + size;
+					}
+				}
+
+				return data + fallback;
+			};
+
+			exclude_once(0x00D64EA0, 0x00D66000, "sound statics");
+			// The libc mspace also holds the NP pool (sceNpInit, 0x20000 at 0x300005d6) and other blocks: only with
+			// RB_SOUND_SEPARATE_MSPACE=1 (o233 crashed with it: SPURS kernel null read right after the first rollbacks)
+			if (std::getenv("RB_SOUND_SEPARATE_MSPACE") && *std::getenv("RB_SOUND_SEPARATE_MSPACE") == '1')
+			{
+				exclude_once(0x30000000, 0x30100000, "libc mspace (sound and network threads)");
+			}
+
+			if (const u32 t = vm::read32(0x00D65ABC))
+			{
+				exclude_once(t, t + 0x24014 + 0xC0 * 0x48, "sound group T (head, queue, voice states)");
+			}
+
+			constexpr u32 g = 0x00D66D60;
+			const u32 core = vm::read32(g + 0xc0);
+			const u32 n = vm::read32(g + 0x80);
+
+			if (core && n && n <= 0x400)
+			{
+				exclude_once(core, core + n * 0x2f0, "sound core voices");
+			}
+
+			if (const u32 list = vm::read32(g + 0xd8), list_n = vm::read32(g + 0xd0); list && list_n && list_n <= 0x1000)
+			{
+				exclude_once(list, list + list_n * 4, "sound core voice list");
+			}
+
+			// Every heap block the bnusCore global points to (hy25: voices 0x23400, mixer work 0xc000 / 0x2000 / 0x280 / 0x200,
+			// voice list 0x34c, ...): the SPU mixer and the update thread write them; restored next to live voices, the mixer
+			// read a null decoder pointer (+0x1b4) and the SPURS kernel crashed (o234, o237)
+			for (u32 off = 0; off < 0x200; off += 4)
+			{
+				const u32 v = vm::read32(g + off);
+
+				if (v >= 0x10000000 && v < 0x40000000 && vm::check_addr(v - 4, vm::page_readable))
+				{
+					const u32 desc = vm::read32(v - 4);
+
+					if (desc && vm::check_addr(desc, vm::page_readable, 0x10) && vm::read32(desc + 4) == v)
+					{
+						if (const u32 size = vm::read32(desc + 0xc); size && size <= 0x100000)
+						{
+							exclude_once(v, v + size, "sound core block (bnusCore global)");
+						}
+					}
+				}
+			}
+
+			// Side blocks of the library (pointer scan hy24; fallback = the extent written in the page map)
+			if (const u32 b = vm::read32(0x00D64C74); b >= 0x10000000)
+			{
+				exclude_once(b, block_end(b, 0x20), "sound block *(0x00D64C74)");
+			}
+
+			if (const u32 sp = vm::read32(0x0097078c); sp && vm::read32(sp))
+			{
+				const u32 s_mgr = vm::read32(sp);
+
+				for (const u32 off : {0x1c40u, 0x1c44u, 0x1c48u})
+				{
+					if (const u32 b = vm::read32(s_mgr + off); b >= 0x10000000)
+					{
+						exclude_once(b, block_end(b, 0x80), "sound block *(S + 0x1c4x)");
+					}
+				}
+			}
+		}
+
 		// RB_SOUND_EXCL_LOWER=1 (r16: with both excluded, sounds failed already in the fight; under investigation)
 		if (std::getenv("RB_ONLINE_SOUND_ROLLBACK") == nullptr && std::getenv("RB_SOUND_EXCL_LOWER") && *std::getenv("RB_SOUND_EXCL_LOWER") == '1')
 		{
@@ -4348,5 +4453,13 @@ namespace rb::online
 				g_predictions, g_mispredictions, g_rollbacks, g_resim_frames, g_predict_waits, g_dbg_get_remote, g_dbg_get_missing, g_dbg_store_remote,
 				g_dbg_store_local, g_remote_last);
 		}
+	}
+
+	void sound_boundary_state(u64& frame, bool& resim, bool& active)
+	{
+		static const bool on = std::getenv("RB_SOUND_SEPARATE") && *std::getenv("RB_SOUND_SEPARATE") == '1';
+		frame = sound_frame_no();
+		resim = sound_resim();
+		active = on && sound_recording_active();
 	}
 }
