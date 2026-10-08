@@ -3739,6 +3739,38 @@ namespace rb::online
 
 		game_mode_frame();
 		sound_frame();
+
+		// Frame pacing of the live fight frames (main loop boundary to boundary): how many exceed 17 / 20 / 33 ms, every 600
+		if (static std::chrono::steady_clock::time_point last{}; mgr && fight_active() && !is_resimulating())
+		{
+			static u64 n = 0, over17 = 0, over20 = 0, over33 = 0, max_us = 0, total_n = 0, total20 = 0;
+			const auto now = std::chrono::steady_clock::now();
+			const u64 us = last.time_since_epoch().count() ? std::chrono::duration_cast<std::chrono::microseconds>(now - last).count() : 0;
+			last = now;
+
+			if (us && us < 1000000)
+			{
+				n++;
+				over17 += us > 17000;
+				over20 += us > 20000;
+				over33 += us > 33300;
+				max_us = std::max(max_us, us);
+
+				if (n == 600)
+				{
+					total_n += n;
+					total20 += over20;
+					rb_online_log.notice("Frame pacing (600 live fight frames): >17 ms %u, >20 ms %u, >33 ms %u, max %u us; all fights: %.1f %% over 20 ms",
+						over17, over20, over33, max_us, 100.0 * total20 / total_n);
+					n = over17 = over20 = over33 = max_us = 0;
+				}
+			}
+		}
+		else if (!fight_active())
+		{
+			last = {};
+		}
+
 		if (mgr && fight_markers() && !is_resimulating())
 		{
 			rb_timing("frame", vm::read32(mgr + 0x60 + (2 - remote_player(mgr)) * 4));

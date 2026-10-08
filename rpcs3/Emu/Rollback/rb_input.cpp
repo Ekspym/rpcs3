@@ -678,6 +678,18 @@ namespace rb
 		return g_boundary_frame;
 	}
 
+	// RB_DEFER_HANDOFF: the live frame end waiting for the next boundary (see rb_frame_step)
+	bool g_defer_pending = false;
+	u64 g_defer_param = 0;
+	u32 g_defer_req = 0;
+	u64 g_defer_run = 0, g_defer_dropped = 0;
+
+	bool defer_handoff()
+	{
+		static const bool on = get_env("RB_DEFER_HANDOFF") == "1";
+		return on;
+	}
+
 	u32 rb_frame_end(ppu_thread& ppu, u64 param)
 	{
 		const u32 old_r1 = static_cast<u32>(ppu.gpr[1]);
@@ -749,6 +761,13 @@ namespace rb
 		{
 			ppu.gpr[3] = 0x00C89800; // NU::Draw::RequestManager
 			ppu.fast_call(0x005c110c, tekken_toc);
+		}
+		else if (defer_handoff() && online::fight_active())
+		{
+			// Run at the next boundary (after the save / a rollback); the lag result is only used with param 0
+			g_defer_pending = true;
+			g_defer_param = param;
+			g_defer_req = vm::read32(0x00D2CA00 + 0x138);
 		}
 		else
 		{
@@ -1949,9 +1968,35 @@ namespace rb
 		depth++;
 		g_task_root = root;
 		const auto t_start = std::chrono::steady_clock::now();
+		const u64 loads_before = state_load_count();
 		frame_boundary();
 		const auto t_state = std::chrono::steady_clock::now();
 		online::on_frame(ppu, root);
+
+		// RB_DEFER_HANDOFF: the previous live frame's frame end, now that its state is saved; dropped when this boundary
+		// loaded a snapshot (that frame was mispredicted and is not shown)
+		if (g_defer_pending)
+		{
+			g_defer_pending = false;
+
+			if (state_load_count() == loads_before)
+			{
+				const u32 old_r1 = static_cast<u32>(ppu.gpr[1]);
+				ppu.gpr[1] = (old_r1 - 0x100) & ~0xfu;
+				vm::write32(static_cast<u32>(ppu.gpr[1]), old_r1);
+				ppu.gpr[3] = 0x00D2CA98;
+				ppu.gpr[4] = g_defer_req;
+				ppu.gpr[5] = g_defer_param;
+				ppu.fast_call(0x00600698, tekken_toc);
+				ppu.gpr[1] = old_r1;
+				g_defer_run++;
+			}
+			else if (++g_defer_dropped % 300 == 1)
+			{
+				rb_log.notice("Deferred hand-off: %u frames not shown after a rollback (%u handed off)", g_defer_dropped, g_defer_run);
+			}
+		}
+
 		const auto t_boundary = std::chrono::steady_clock::now();
 
 		// Stutter statistics: wall clock time between consecutive live frames after the sync point (a rollback's

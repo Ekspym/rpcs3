@@ -765,8 +765,83 @@ namespace rb
 
 			const auto start = std::chrono::steady_clock::now();
 
-			while (*vm::get_super_ptr<u64>(addr) != 0u && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(100))
+			// RB_DRAW_IDLE_RSX=1: the draw thread counts as idle once it is blocked at 0x005fa650 (FUN_005fa558: it queued an
+			// RSX semaphore after the frame's commands and waits for the GPU): its work on the frame is done, only the RSX
+			// still reads the render buffers (o248: every wait over 2 ms had the thread there). The request state +0xA8 is
+			// cleared only after that GPU wait (~7-12 ms per frame of the waits before).
+			static const bool idle_rsx = std::getenv("RB_DRAW_IDLE_RSX") && *std::getenv("RB_DRAW_IDLE_RSX") == '1';
+			static u32 draw_tid = 0;
+
+			const auto draw_waits_for_rsx = [&]() -> bool
 			{
+				if (!idle_rsx)
+				{
+					return false;
+				}
+
+				if (!draw_tid)
+				{
+					idm::select<named_thread<ppu_thread>>([&](u32 id, named_thread<ppu_thread>& t)
+					{
+						const auto name = t.ppu_tname.load();
+
+						if (name && name->starts_with("NU::Draw"))
+						{
+							draw_tid = id;
+						}
+					});
+				}
+
+				bool at = false;
+
+				if (draw_tid)
+				{
+					idm::check<named_thread<ppu_thread>>(draw_tid, [&](named_thread<ppu_thread>& t)
+					{
+						at = (t.state & cpu_flag::wait) && t.cia == 0x005fa650;
+					});
+				}
+
+				return at;
+			};
+
+			// RB_DRAW_WAIT_DIAG=1: where the draw thread is while the wait lasts over 2 ms (histogram of cia / wait state,
+			// logged every 300 samples)
+			static const bool wait_diag = std::getenv("RB_DRAW_WAIT_DIAG") && *std::getenv("RB_DRAW_WAIT_DIAG") == '1';
+			bool sampled = false;
+
+			while (*vm::get_super_ptr<u64>(addr) != 0u && !draw_waits_for_rsx() && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(100))
+			{
+				if (wait_diag && !sampled && std::chrono::steady_clock::now() - start > std::chrono::milliseconds(2))
+				{
+					sampled = true;
+					static std::map<std::string, u32> hist;
+					static u32 samples = 0;
+
+					idm::select<named_thread<ppu_thread>>([&](u32, named_thread<ppu_thread>& t)
+					{
+						const auto name = t.ppu_tname.load();
+
+						if (name && name->starts_with("NU::Draw"))
+						{
+							hist[fmt::format("%s cia=0x%08x lr=0x%08x", (t.state & cpu_flag::wait) ? "WAIT" : "RUN", t.cia, static_cast<u32>(t.lr))]++;
+						}
+					});
+
+					if (++samples % 300 == 0)
+					{
+						std::string text;
+
+						for (const auto& [k, n] : hist)
+						{
+							fmt::append(text, "\n  %4u %s", n, k);
+						}
+
+						rb_log.notice("Draw thread during the idle wait (%u samples, value 0x%x):%s", samples, +*vm::get_super_ptr<u64>(addr), text);
+						hist.clear();
+					}
+				}
+
 				sys_timer_usleep(*ppu, 100);
 			}
 
@@ -793,7 +868,7 @@ namespace rb
 				}
 			}
 
-			if (*vm::get_super_ptr<u64>(addr) != 0u)
+			if (*vm::get_super_ptr<u64>(addr) != 0u && !draw_waits_for_rsx())
 			{
 				rb_log.error("Draw idle wait timed out (0x%08x = %u)", addr, +*vm::get_super_ptr<u64>(addr));
 			}
@@ -1729,6 +1804,58 @@ namespace rb
 		if (st == track_none)
 		{
 			return false;
+		}
+
+		// RB_DRAW_WRITES=1 (diagnostics): snapshot pages written by the game's draw thread (NU::Draw::RequestManager) -
+		// what a save or load concurrent with drawing would tear; logged as ranges every 2000 new faults
+		if (static const bool draw_diag = std::getenv("RB_DRAW_WRITES") && *std::getenv("RB_DRAW_WRITES") == '1'; draw_diag)
+		{
+			if (const auto cpu = cpu_thread::get_current(); cpu && cpu->get_class() == thread_class::ppu && cpu->id != 0x1000000)
+			{
+				const auto name = static_cast<ppu_thread*>(cpu)->ppu_tname.load();
+
+				if (name && name->starts_with("NU::Draw"))
+				{
+					static std::mutex m;
+					static std::map<u32, u64> pages;
+					static u64 faults = 0;
+					std::lock_guard lock(m);
+					pages[page]++;
+
+					if (faults < 40)
+					{
+						const auto& ppu = *static_cast<ppu_thread*>(cpu);
+						rb_log.notice("Draw thread write: 0x%08x by cia 0x%08x lr 0x%08x r3 0x%x r4 0x%x", addr, ppu.cia, ppu.lr, ppu.gpr[3], ppu.gpr[4]);
+					}
+
+					if (++faults % 2000 == 0 || (faults & (faults - 1)) == 0)
+					{
+						std::string text;
+						u32 begin = 0, end = 0;
+						u64 hits = 0;
+
+						for (const auto& [pg, n] : pages)
+						{
+							if (pg != end)
+							{
+								if (end)
+								{
+									fmt::append(text, " 0x%08x-0x%08x(%u)", begin << 12, end << 12, hits);
+								}
+
+								begin = pg;
+								hits = 0;
+							}
+
+							end = pg + 1;
+							hits += n;
+						}
+
+						fmt::append(text, " 0x%08x-0x%08x(%u)", begin << 12, end << 12, hits);
+						rb_log.notice("Draw thread writes to snapshot pages (%u faults, %u pages):%s", faults, pages.size(), text);
+					}
+				}
+			}
 		}
 
 		if (g_foreign)
