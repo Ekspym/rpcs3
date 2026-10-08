@@ -1475,6 +1475,13 @@ namespace rb
 		ppu.fast_call(vm::read32(opd), vm::read32(opd + 4));
 	}
 
+	// Game function of the draw root: in RPCS3 (the drawing code calls cellGcm constantly; in the hybrid each of those
+	// calls is a host transition: the lifted draw tree was slower, o262 live tasks 8.3 vs 6.4 ms)
+	void call_game(ppu_thread& ppu, u32 addr)
+	{
+		ppu.fast_call(addr, tekken_toc);
+	}
+
 	u32 g_last_game_mode = umax; // game mode (FUN_0020c754) seen by the last re-simulated draw pass
 
 	u32 last_game_mode()
@@ -1712,7 +1719,7 @@ namespace rb
 		if (!state_resimulating(g_boundary_frame))
 		{
 			ppu.gpr[3] = self;
-			ppu.fast_call(0x001001c0, tekken_toc);
+			call_game(ppu, 0x001001c0);
 		}
 
 		lap(0);
@@ -1737,7 +1744,7 @@ namespace rb
 				ppu.gpr[3] = vm::read32(0x00A77C34);
 				ppu.gpr[4] = 0;
 				ppu.gpr[5] = 1;
-				ppu.fast_call(0x000ffff8, tekken_toc);
+				call_game(ppu, 0x000ffff8);
 			}
 
 			lap(2);
@@ -1745,7 +1752,7 @@ namespace rb
 		else if (!(film_kept() && state_resimulating(g_boundary_frame)))
 		{
 			ppu.gpr[3] = weak(0x00A78C60, 0x2c);
-			ppu.fast_call(0x00104d50, tekken_toc);
+			call_game(ppu, 0x00104d50);
 			lap(1);
 		}
 

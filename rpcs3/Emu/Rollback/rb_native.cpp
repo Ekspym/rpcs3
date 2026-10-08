@@ -441,12 +441,13 @@ namespace rb::native
 	// function (the caller runs it in RPCS3)
 	bool call(ppu_thread& ppu, u32 addr)
 	{
+		// Before the DLL check: the player's first run (no DLL yet) dumps the firmware modules to build it
+		dump_modules();
+
 		if (!init())
 		{
 			return false;
 		}
-
-		dump_modules();
 
 		if (static u32 steps = 0; ++steps % 3600 == 0)
 		{
