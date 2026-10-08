@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <vector>
 
@@ -33,6 +34,19 @@ namespace rb
 
 	// Snapshot loads so far (online, stress and netplay rollbacks)
 	u64 state_load_count();
+
+	// Diagnostics: host time (us) spent so far in snapshot saves, snapshot loads, waits for the draw thread and waits for
+	// SPURS jobs (online); the re-simulated frame parts report splits the boundary time with them
+	enum class diag_t { save, load, draw_wait, spurs_wait, count };
+	std::atomic<u64>& state_diag_us(diag_t what);
+
+	struct diag_scope
+	{
+		diag_t what;
+		u64 t0;
+		explicit diag_scope(diag_t w);
+		~diag_scope();
+	};
 
 	// Write tracking of the calibrated pages (RB_SNAP_TRACK=1). on_write_fault is called by the access violation
 	// handler: true when the page was a tracked clean page (now dirty and writable). note_write is called by the

@@ -35,6 +35,24 @@ extern std::atomic<u64> g_audio_dump_frames; // AudioDumper.cpp
 
 namespace rb
 {
+	std::atomic<u64>& state_diag_us(diag_t what)
+	{
+		static std::atomic<u64> us[static_cast<int>(diag_t::count)]{};
+		return us[static_cast<int>(what)];
+	}
+
+	static u64 diag_now_us()
+	{
+		return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	}
+
+	diag_scope::diag_scope(diag_t w) : what(w), t0(diag_now_us()) {}
+
+	diag_scope::~diag_scope()
+	{
+		state_diag_us(what) += diag_now_us() - t0;
+	}
+
 	namespace
 	{
 		struct range_t
@@ -750,6 +768,8 @@ namespace rb
 
 		void wait_for_draw_idle()
 		{
+			const diag_scope diag(diag_t::draw_wait);
+
 			static const u32 addr = []() -> u32
 			{
 				const char* v = std::getenv("RB_SNAP_IDLE_WAIT");
@@ -1357,6 +1377,8 @@ namespace rb
 		template <bool Save>
 		void copy(u32 slot)
 		{
+			const diag_scope diag(Save ? diag_t::save : diag_t::load);
+
 			// No page may be unmapped while the copy threads use it (r7: the file loader thread freed a heap page between the
 			// check below and the copy, the copy threads crashed reading it); vm::dealloc takes the same lock
 			// (the lock requires the caller's cpu_flag::wait, as for any thread that may block on it)

@@ -2008,6 +2008,13 @@ namespace rb
 			parts = {};
 		}
 		const u64 loads_before = state_load_count();
+		u64 diag_before[static_cast<int>(diag_t::count)];
+
+		for (int k = 0; k < static_cast<int>(diag_t::count); k++)
+		{
+			diag_before[k] = state_diag_us(static_cast<diag_t>(k));
+		}
+
 		frame_boundary();
 		const auto t_state = std::chrono::steady_clock::now();
 		online::on_frame(ppu, root);
@@ -2103,8 +2110,16 @@ namespace rb
 		if (g_state.synced && state_resimulating(g_state.seq[0]))
 		{
 			static u64 n = 0, b_total = 0, w_total = 0, st_total = 0, st_max = 0;
+			static u64 diag_total[static_cast<int>(diag_t::count)]{};
 			const auto now = std::chrono::steady_clock::now();
 			const u64 st = std::chrono::duration_cast<std::chrono::microseconds>(t_state - t_start).count();
+
+			// The parts of the snapshot module (and online bookkeeping) in this boundary
+			for (int k = 0; k < static_cast<int>(diag_t::count); k++)
+			{
+				diag_total[k] += state_diag_us(static_cast<diag_t>(k)) - diag_before[k];
+			}
+
 			b_total += std::chrono::duration_cast<std::chrono::microseconds>(t_boundary - t_start).count();
 			w_total += std::chrono::duration_cast<std::chrono::microseconds>(now - t_boundary).count();
 			st_total += st;
@@ -2114,7 +2129,10 @@ namespace rb
 			{
 				rb_log.notice("Re-simulated frame parts: boundary avg %u us (snapshot module %u us, max %u us; online %u us), tasks avg %u us (1000 frames)",
 					b_total / 1000, st_total / 1000, st_max, (b_total - st_total) / 1000, w_total / 1000);
+				rb_log.notice("Re-simulated boundary parts (avg per frame): save %u us, load %u us, draw thread wait %u us, SPURS job wait %u us",
+					diag_total[0] / 1000, diag_total[1] / 1000, diag_total[2] / 1000, diag_total[3] / 1000);
 				b_total = w_total = st_total = st_max = 0;
+				std::fill(std::begin(diag_total), std::end(diag_total), 0);
 			}
 		}
 

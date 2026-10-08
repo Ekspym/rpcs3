@@ -2875,6 +2875,8 @@ namespace rb::online
 	// max_wait_us: a re-simulated boundary waits at most 1 ms (20 ms per boundary made 0.5-0.9 s spikes in o121)
 	static bool spurs_job_pending(ppu_thread& ppu, u32 max_wait_us = 20000)
 	{
+		const diag_scope diag(diag_t::spurs_wait);
+
 		for (const auto& [ptr, offset] : {std::pair{0x009680acu, 0u}, std::pair{0x009680acu, 0x380u}, std::pair{0x009680acu, 0x700u},
 			std::pair{0x009682ecu, 0x80u}, std::pair{0x00968324u, 0x4e80u}})
 		{
