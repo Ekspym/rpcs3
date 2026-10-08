@@ -846,8 +846,9 @@ namespace rb::online
 	// a rollback). The game's own loop has no limit; a real job takes well below 20 ms.
 	// Jobs whose pending wait was cancelled by a load (restored state, completion bit not set). Their next launches in the
 	// re-simulation did not finish at times either (job chain state of the other timeline): 2 x 200 ms in one rollback
-	// (o161: 414 / 419 ms). They are waited for at most 20 ms, in live frames too (online 2026-10-08: a live frame after a
-	// rollback waited the full 200 ms for job 0x00b80800, a 225 ms freeze in the fight; it did not finish either).
+	// (o161: 414 / 419 ms). They are waited for at most 20 ms, in live frames too and for good (online 2026-10-08: a live
+	// frame after a rollback waited the full 200 ms for job 0x00b80800, a 225 ms freeze; o269: forgotten once the job had
+	// finished, it got stuck again at the next round start, 200 ms).
 	std::set<u32> g_restore_cancelled_jobs;
 	// Such a job that also timed out in the re-simulation: the next launch (the frame the rollback happened in, not a
 	// re-simulated one) waited the full 200 ms and did not finish either (o189 228 ms, o209 233 ms rollbacks). Until it
@@ -921,7 +922,6 @@ namespace rb::online
 		{
 			// Not running (finished): later launches of this job object are waited for normally again
 			stuck_waits.erase(job);
-			g_restore_cancelled_jobs.erase(job);
 			g_restore_timed_out_jobs.erase(job);
 		}
 		else if (stuck_waits[job] >= 2 && vm::read16(job + 0x200) == 0)
@@ -946,7 +946,6 @@ namespace rb::online
 				if (static_cast<u32>(ppu.gpr[3]) == 0)
 				{
 					stuck_waits[job] = 0;
-					g_restore_cancelled_jobs.erase(job);
 					g_restore_timed_out_jobs.erase(job);
 					break;
 				}
