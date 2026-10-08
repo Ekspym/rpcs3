@@ -683,6 +683,7 @@ namespace rb
 	u64 g_defer_param = 0;
 	u32 g_defer_req = 0;
 	u64 g_defer_run = 0, g_defer_dropped = 0;
+	u64 g_handoff_us = 0; // time in the deferred hand-off since the last read (RB_SLOW_FRAMES)
 
 	bool defer_handoff()
 	{
@@ -1968,6 +1969,37 @@ namespace rb
 		depth++;
 		g_task_root = root;
 		const auto t_start = std::chrono::steady_clock::now();
+
+		// RB_SLOW_FRAMES: parts of the current live interval (closed at the next live frame start)
+		struct slow_parts { u64 boundary = 0, handoff = 0, live_tasks = 0, resim_tasks = 0, resim_frames = 0, loads = 0; };
+		static slow_parts parts{};
+		static std::chrono::steady_clock::time_point live_start{};
+		static const bool slow_diag = get_env("RB_SLOW_FRAMES") == "1";
+		const bool resim_iteration = state_resimulating(g_state.seq[0]);
+
+		if (slow_diag && !resim_iteration)
+		{
+			if (live_start.time_since_epoch().count() && online::fight_active())
+			{
+				const u64 us = std::chrono::duration_cast<std::chrono::microseconds>(t_start - live_start).count();
+				static u64 n = 0, slow = 0;
+				n++;
+
+				if (us > 20000 && us < 1000000)
+				{
+					slow++;
+
+					if (static u32 logged = 0; logged++ < 300)
+					{
+						rb_log.notice("Slow live interval %u us: boundaries %u, hand-off %u, live tasks %u, re-simulated %u frames %u us, loads %u (%u of %u slow)",
+							us, parts.boundary, parts.handoff, parts.live_tasks, parts.resim_frames, parts.resim_tasks, parts.loads, slow, n);
+					}
+				}
+			}
+
+			live_start = t_start;
+			parts = {};
+		}
 		const u64 loads_before = state_load_count();
 		frame_boundary();
 		const auto t_state = std::chrono::steady_clock::now();
@@ -1987,7 +2019,9 @@ namespace rb
 				ppu.gpr[3] = 0x00D2CA98;
 				ppu.gpr[4] = g_defer_req;
 				ppu.gpr[5] = g_defer_param;
+				const auto h0 = std::chrono::steady_clock::now();
 				ppu.fast_call(0x00600698, tekken_toc);
+				g_handoff_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - h0).count();
 				ppu.gpr[1] = old_r1;
 				g_defer_run++;
 			}
@@ -1998,6 +2032,7 @@ namespace rb
 		}
 
 		const auto t_boundary = std::chrono::steady_clock::now();
+		const auto t_walk_start = std::chrono::steady_clock::now();
 
 		// Stutter statistics: wall clock time between consecutive live frames after the sync point (a rollback's
 		// re-simulated frames are part of the live frame interval they delay)
@@ -2028,6 +2063,26 @@ namespace rb
 		if (!net::run_frame(ppu, root, g_state.seq[0]))
 		{
 			run_task_walk(ppu, root);
+		}
+
+		if (slow_diag)
+		{
+			const auto now = std::chrono::steady_clock::now();
+			const u64 walk = std::chrono::duration_cast<std::chrono::microseconds>(now - t_walk_start).count();
+			parts.handoff += g_handoff_us;
+			parts.boundary += std::chrono::duration_cast<std::chrono::microseconds>(t_walk_start - t_start).count() - g_handoff_us;
+			g_handoff_us = 0;
+			parts.loads += state_load_count() != loads_before;
+
+			if (state_resimulating(g_state.seq[0]))
+			{
+				parts.resim_tasks += walk;
+				parts.resim_frames++;
+			}
+			else
+			{
+				parts.live_tasks += walk;
+			}
 		}
 
 		// Messages that arrived during this frame (its vblank wait) are received now, not in the next frame's tasks:

@@ -1642,6 +1642,14 @@ namespace rb::online
 	// library calls of re-simulated frames. The bookkeeping that guessed which sounds belonged to a discarded timeline
 	// (stop after the re-simulation, leak cleanup) is off: it saw no PLAY in the re-simulation and cut correct sounds (o243:
 	// 278 "discarded" stops). Sounds play on as if there was no rollback.
+	// RB_ONLINE_SOUND_ROLLBACK (diagnostics): the sound library is rolled back like the game; read once (the sound
+	// exclusions run every frame: getenv there cost ~1.7 % of a re-simulation, o250)
+	bool sound_rollback_env()
+	{
+		static const bool on = std::getenv("RB_ONLINE_SOUND_ROLLBACK") != nullptr;
+		return on;
+	}
+
 	bool sound_separate()
 	{
 		static const bool on = std::getenv("RB_SOUND_SEPARATE") && *std::getenv("RB_SOUND_SEPARATE") == '1';
@@ -3439,7 +3447,7 @@ namespace rb::online
 		{
 			sound_manager = vm::read32(vm::read32(0x0097078c));
 
-			if (vm::check_addr(sound_manager, vm::page_readable) && std::getenv("RB_ONLINE_SOUND_ROLLBACK") == nullptr)
+			if (vm::check_addr(sound_manager, vm::page_readable) && !sound_rollback_env())
 			{
 				// The whole nuSound2 library state stays out of the rollback (the user: sound must not be rolled back): the
 				// manager S (handle counter +4, bank manager +0x1c38, voice table +0x1c3c, voices +0x24014: 0x28000 bytes), the
@@ -3473,7 +3481,7 @@ namespace rb::online
 		// queue *(+0x3c) and waits on the queue *(+0x44) for "END ". Restoring the queues (CellSyncLFQueue, 0x80 bytes, buffer
 		// *(+0x1c) of size +0x10 x depth +0x14) or their taskset (m_eaSignal +0x74, CellSpursTaskset 0x1900 bytes) from a
 		// snapshot left the update thread waiting forever: all sound went silent shortly after the first rollbacks (s20).
-		if (std::getenv("RB_ONLINE_SOUND_ROLLBACK") == nullptr)
+		if (!sound_rollback_env())
 		{
 			static std::set<u32> done;
 			constexpr u32 core_thread_arg = 0x00D66D60;
@@ -3526,7 +3534,7 @@ namespace rb::online
 
 		// RB_SOUND_SEPARATE=1: the rest of the sound library outside the rollback as one unit (statics, group T, core voices,
 		// side blocks, the libc mspace of the sound/network threads); see recomp_t6/fix_separate.py
-		if (std::getenv("RB_ONLINE_SOUND_ROLLBACK") == nullptr && std::getenv("RB_SOUND_SEPARATE") && *std::getenv("RB_SOUND_SEPARATE") == '1')
+		if (!sound_rollback_env() && sound_separate())
 		{
 			static std::set<u64> done;
 			const auto exclude_once = [](u32 from, u32 to, const char* what)
@@ -3564,7 +3572,7 @@ namespace rb::online
 			exclude_once(0x00D64EA0, 0x00D66000, "sound statics");
 			// The libc mspace also holds the NP pool (sceNpInit, 0x20000 at 0x300005d6) and other blocks: only with
 			// RB_SOUND_SEPARATE_MSPACE=1 (o233 crashed with it: SPURS kernel null read right after the first rollbacks)
-			if (std::getenv("RB_SOUND_SEPARATE_MSPACE") && *std::getenv("RB_SOUND_SEPARATE_MSPACE") == '1')
+			if (static const bool mspace = std::getenv("RB_SOUND_SEPARATE_MSPACE") && *std::getenv("RB_SOUND_SEPARATE_MSPACE") == '1'; mspace)
 			{
 				exclude_once(0x30000000, 0x30100000, "libc mspace (sound and network threads)");
 			}
@@ -3630,7 +3638,7 @@ namespace rb::online
 		}
 
 		// RB_SOUND_EXCL_LOWER=1 (r16: with both excluded, sounds failed already in the fight; under investigation)
-		if (std::getenv("RB_ONLINE_SOUND_ROLLBACK") == nullptr && std::getenv("RB_SOUND_EXCL_LOWER") && *std::getenv("RB_SOUND_EXCL_LOWER") == '1')
+		if (!sound_rollback_env() && []{ static const bool v = std::getenv("RB_SOUND_EXCL_LOWER") && *std::getenv("RB_SOUND_EXCL_LOWER") == '1'; return v; }())
 		{
 			static u32 last_t = 0, last_core = 0;
 			const u32 t = vm::read32(0x00D65ABC);
@@ -3669,7 +3677,7 @@ namespace rb::online
 		// table) is already outside the rollback and KeyOn is deduplicated; restoring the lower layers rewound every playing voice
 		// on each load (all sounds distorted at every rollback). RB_SOUND_EXCL_LOWER also excluded the whole nuSound2 group head
 		// (T+0..0x24010) and froze the mixer (o171); these stages leave it alone.
-		if (std::getenv("RB_ONLINE_SOUND_ROLLBACK") == nullptr)
+		if (!sound_rollback_env())
 		{
 			const auto env_on = [](const char* name) { const char* v = std::getenv(name); return v && *v == '1'; };
 			static const bool core_run = env_on("RB_SOUND_EXCL_CORE_RUN");

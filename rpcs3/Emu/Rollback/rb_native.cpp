@@ -67,6 +67,7 @@ namespace rb::native
 		void (*check_state)();                             // polled on the lifted code's backward branches
 		void (*sound_frame)(u64* frame, u64* loads, int* resim, int* active); // sound boundary (RB_SOUND_SEPARATE)
 		int (*addr_saved)(u32 addr);                       // rb::state_addr_saved: 2 = excluded from the snapshots
+		void (*frame_state)(int* resim, int* synced);      // re-simulated frame, fight sync point passed (task skips in the DLL)
 	};
 
 	using init_fn = int (*)(const host_api*);
@@ -204,6 +205,14 @@ namespace rb::native
 		*active = a;
 	}
 
+	void host_frame_state(int* resim, int* synced)
+	{
+		u32 seq[2]{};
+		get_seq(seq);
+		*resim = online::is_resimulating() || state_resimulating(boundary_frame());
+		*synced = sync_game_frame() != umax;
+	}
+
 	int host_addr_saved(u32 addr)
 	{
 		return rb::state_addr_saved(addr);
@@ -252,7 +261,7 @@ namespace rb::native
 				return false;
 			}
 
-			static const host_api api{vm::g_base_addr, host_call_guest, host_syscall, host_timebase, host_load_reserve, host_store_cond, host_check_state, host_sound_frame, host_addr_saved};
+			static const host_api api{vm::g_base_addr, host_call_guest, host_syscall, host_timebase, host_load_reserve, host_store_cond, host_check_state, host_sound_frame, host_addr_saved, host_frame_state};
 			const int n = init_f(&api);
 
 			// Functions with hooks or patches (HLE replacements of the rollback modules, game patches) and

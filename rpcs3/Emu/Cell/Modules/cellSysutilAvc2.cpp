@@ -707,7 +707,8 @@ error_code cellSysutilAvc2LeaveChatRequest()
 
 error_code cellSysutilAvc2IsMicAttached(vm::ptr<u8> status)
 {
-	cellSysutilAvc2.todo("cellSysutilAvc2IsMicAttached(status=*0x%x)", status);
+	// Tekken 6 polls this every frame: the TODO line filled the log (and cost time in re-simulated frames)
+	if (static u32 logged = 0; logged++ < 5) cellSysutilAvc2.todo("cellSysutilAvc2IsMicAttached(status=*0x%x)", status);
 
 	ensure(!!status); // I couldn't find any error value for this (should be CELL_AVC2_ERROR_INVALID_ARGUMENT if anything)
 
