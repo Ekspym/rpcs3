@@ -714,6 +714,13 @@ namespace rb
 			{
 				catchup_start = {};
 			}
+			else if (online::sync_ahead())
+			{
+				// Ahead of the other side: no catch-up, and the time behind the wall clock is forgiven (counting starts
+				// again), otherwise it was caught up as soon as this side was no longer ahead
+				catchup_start = {};
+				catchup_row = 0;
+			}
 			else
 			{
 				const auto now = std::chrono::steady_clock::now();
@@ -2018,6 +2025,13 @@ namespace rb
 		{
 			g_defer_pending = false;
 
+			// The frame end waits for the next vblank. A dropped one did not: every rollback made the game a part of a frame
+			// faster, 63 game frames per second instead of 59.94 in the native package (o250-o267, both sides alike), online
+			// 60.3-61.9 on the side with more rollbacks: it ran ahead of the other for whole matches. A dropped frame end
+			// waits until one frame after the last one instead.
+			static std::chrono::steady_clock::time_point last_handoff{};
+			constexpr auto frame = std::chrono::nanoseconds(16683350);
+
 			if (state_load_count() == loads_before)
 			{
 				const u32 old_r1 = static_cast<u32>(ppu.gpr[1]);
@@ -2028,13 +2042,30 @@ namespace rb
 				ppu.gpr[5] = g_defer_param;
 				const auto h0 = std::chrono::steady_clock::now();
 				ppu.fast_call(0x00600698, tekken_toc);
-				g_handoff_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - h0).count();
+				last_handoff = std::chrono::steady_clock::now();
+				g_handoff_us += std::chrono::duration_cast<std::chrono::microseconds>(last_handoff - h0).count();
 				ppu.gpr[1] = old_r1;
 				g_defer_run++;
 			}
-			else if (++g_defer_dropped % 300 == 1)
+			else
 			{
-				rb_log.notice("Deferred hand-off: %u frames not shown after a rollback (%u handed off)", g_defer_dropped, g_defer_run);
+				const auto now = std::chrono::steady_clock::now();
+				const auto due = last_handoff + frame;
+
+				if (last_handoff.time_since_epoch().count() && now < due && due - now <= frame)
+				{
+					std::this_thread::sleep_until(due);
+					last_handoff = due;
+				}
+				else
+				{
+					last_handoff = now;
+				}
+
+				if (++g_defer_dropped % 300 == 1)
+				{
+					rb_log.notice("Deferred hand-off: %u frames not shown after a rollback (%u handed off)", g_defer_dropped, g_defer_run);
+				}
 			}
 		}
 

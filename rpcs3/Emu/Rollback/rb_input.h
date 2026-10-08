@@ -122,6 +122,7 @@ namespace rb
 		void install_hooks(std::vector<u32>& applied);
 		bool is_resimulating();
 		bool fight_active(); // the online fight with prediction runs (rollbacks possible)
+		bool sync_ahead(); // this side runs ahead of the other beyond the time sync target (no catch-up then)
 		void stress_sound_after_load(u64 target); // RB_STRESS_SOUND: sound bookkeeping after an offline stress load
 		void sound_runtime_before_load(); // RB_SOUND_KEEP_RUNTIME: playback runtime of the sound core voices around a load
 		void sound_runtime_after_load();
