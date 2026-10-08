@@ -714,13 +714,6 @@ namespace rb
 			{
 				catchup_start = {};
 			}
-			else if (online::sync_ahead())
-			{
-				// Ahead of the other side: no catch-up, and the time behind the wall clock is forgiven (counting starts
-				// again), otherwise it was caught up as soon as this side was no longer ahead
-				catchup_start = {};
-				catchup_row = 0;
-			}
 			else
 			{
 				const auto now = std::chrono::steady_clock::now();
@@ -2042,50 +2035,6 @@ namespace rb
 			else if (++g_defer_dropped % 300 == 1)
 			{
 				rb_log.notice("Deferred hand-off: %u frames not shown after a rollback (%u handed off)", g_defer_dropped, g_defer_run);
-			}
-		}
-
-		// Frame rate cap of the online fight: at most 60 live frames per second of wall clock time (the vblank rate), one frame
-		// of jitter ahead; a late frame may be caught up by up to 2 frames, nothing more is banked. The native package ran
-		// 61-64 game frames per second (dropped frame ends, catch-up): that side ran ahead of the other for whole matches,
-		// with rollbacks every few frames and an auto delay up to 8 frames (online 2026-10-08).
-		if (online::fight_active() && !state_resimulating(g_state.seq[0]))
-		{
-			static std::chrono::steady_clock::time_point t0{};
-			static u64 count = 0, capped = 0, capped_us = 0, n = 0;
-			constexpr double fps = 60.0;
-			constexpr double ahead = 1.0, behind = 2.0;
-			const auto now = std::chrono::steady_clock::now();
-			const double elapsed = std::chrono::duration<double>(now - t0).count();
-
-			if (!t0.time_since_epoch().count() || elapsed > 1.0 + static_cast<double>(count) / fps)
-			{
-				// Start, or more than a second behind (pause, round transition): count again from here
-				t0 = now;
-				count = 0;
-			}
-			else if (static_cast<double>(count) < elapsed * fps - behind)
-			{
-				// Behind by more than 2 frames: forget the rest
-				t0 = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>((static_cast<double>(count) + behind) / fps));
-			}
-
-			const auto due = t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>((static_cast<double>(count) - ahead) / fps));
-
-			if (now < due)
-			{
-				std::this_thread::sleep_until(due);
-				capped++;
-				capped_us += std::chrono::duration_cast<std::chrono::microseconds>(due - now).count();
-			}
-
-			count++;
-
-			if (++n % 600 == 0)
-			{
-				rb_log.notice("Frame cap: %u of the last 600 live frames waited (avg %u us), %.2f frames per second since the anchor", capped,
-					capped ? capped_us / capped : 0, static_cast<double>(count) / std::max(1e-3, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()));
-				capped = capped_us = 0;
 			}
 		}
 

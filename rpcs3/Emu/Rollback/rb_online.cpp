@@ -2845,20 +2845,6 @@ namespace rb::online
 		return config().predict && in_fight() && ring_ready();
 	}
 
-	static double sync_target()
-	{
-		static const double target = std::getenv("RB_ONLINE_SYNC_TARGET") ? std::atof(std::getenv("RB_ONLINE_SYNC_TARGET")) : 1.0;
-		return target;
-	}
-
-	// This side runs ahead of the other by more than the time sync target. The catch-up (RB_CATCHUP) must not run then: it
-	// repaid the frames the time sync held back, the weaker side stayed 2-3 frames ahead for a whole match with a rollback
-	// every 6 frames (5600H vs 5800X, 14 ms RTT: 3000 holds, 15.7-16.2 ms per game frame on the ahead side)
-	bool sync_ahead()
-	{
-		return sync_target() > 0 && g_sync_avg > sync_target();
-	}
-
 	bool mute_stream(u64 opened_ns)
 	{
 		// With RB_SOUND_SEPARATE the music stream is not rolled back: not muted by default
@@ -3804,7 +3790,7 @@ namespace rb::online
 
 		// Time synchronisation (see g_sync_hold): measured in live fight frames only
 		{
-			const double target = sync_target();
+			static const double target = std::getenv("RB_ONLINE_SYNC_TARGET") ? std::atof(std::getenv("RB_ONLINE_SYNC_TARGET")) : 1.0;
 			u32 sq[2]{};
 			get_seq(sq);
 			g_sync_hold = false;
