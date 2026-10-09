@@ -384,8 +384,14 @@ namespace rb
 
 			pad_cmd& cmd = g_pad_cmds.front();
 
-			// A connected pad with centered sticks and the scripted buttons
-			data->len = 24;
+			// A connected pad with centered sticks and the scripted buttons. RB_PAD_CMD_REALLEN=1: like a real pad in RPCS3
+			// (cellPadGetData without the sensor setting), "no change" (len 0) when the buttons did not change since the
+			// last read - the test then sees what players see (a restored pad state is not refreshed until the next change)
+			static const bool real_len = get_env("RB_PAD_CMD_REALLEN") == "1";
+			static u32 last_buttons = 0xffffffff;
+			const u32 buttons = (u32{cmd.digital1} << 16) | cmd.digital2;
+			data->len = (!real_len || buttons != last_buttons || !online::fight_active()) ? 24 : 0;
+			last_buttons = buttons;
 			data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = cmd.digital1;
 			data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = cmd.digital2;
 
