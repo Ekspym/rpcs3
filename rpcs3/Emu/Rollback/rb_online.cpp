@@ -274,7 +274,7 @@ namespace rb::online
 
 				if (f)
 				{
-					const std::string header = "sim_frame,game_frame,resim,state_hash,camera_hash,sim_p1,sim_p2,p1pos,p2pos,in1,in2\n";
+					const std::string header = "sim_frame,game_frame,resim,state_hash,camera_hash,sim_p1,sim_p2,p1pos,p2pos,in1,in2,raw1,raw2\n";
 					f.write(header.data(), header.size());
 				}
 
@@ -312,9 +312,25 @@ namespace rb::online
 					return fmt::format("%08x", h);
 				};
 
-				const std::string line = fmt::format("%u,%u,%u,%016x,%016x,%u,%u,%s,%s,%s,%s\n", sim, game_frame, resim ? 1 : 0, state_hash(0), state_hash(1),
+				// The button words of the same entry (predict_entry: held/pressed/repeat, mapped held/pressed/repeat) and +0x48
+				const auto raw = [&](u32 i) -> std::string
+				{
+					const u32 s = mgr ? +vm::read32(mgr + 0x60 + i * 4) : 0;
+					const u32 entries = mgr ? +vm::read32(mgr + i * 0x10 + 0x1c) : 0;
+
+					if (!s || !entries || !(vm::read8(vm::read32(mgr + i * 0x10 + 0x3c) + (s - 1) % ring) & 1))
+					{
+						return "-";
+					}
+
+					const u32 e = entries + ((s - 1) % ring) * entry_size;
+					return fmt::format("%x/%x/%x/%x/%x/%x/%x", +vm::read32(e), +vm::read32(e + 4), +vm::read32(e + 8), +vm::read32(e + 0xC),
+						+vm::read32(e + 0x10), +vm::read32(e + 0x14), +vm::read32(e + 0x48));
+				};
+
+				const std::string line = fmt::format("%u,%u,%u,%016x,%016x,%u,%u,%s,%s,%s,%s,%s,%s\n", sim, game_frame, resim ? 1 : 0, state_hash(0), state_hash(1),
 					mgr ? static_cast<u32>(vm::read32(mgr + 0x60)) : 0u, mgr ? static_cast<u32>(vm::read32(mgr + 0x64)) : 0u, pos(0x00B2CA3C),
-					pos(0x00B2D67C), input(0), input(1));
+					pos(0x00B2D67C), input(0), input(1), raw(0), raw(1));
 				out.write(line.data(), line.size());
 			}
 		}
