@@ -336,6 +336,66 @@ namespace rb::online
 			return vm::read32(mgr + i * 0x10 + 0x3c) + frame % ring;
 		}
 
+		// Predicted remote entry of frame sim. FUN_00186a10 builds an entry from the pad object (FUN_00185620): +0x00 held,
+		// +0x04 pressed (held & ~held of the previous frame), +0x08 repeat (FUN_0018520c: set on the press, after 20 frames
+		// held, then every 4), the same three words for the mapped buttons at +0x0C/+0x10/+0x14 (FUN_0018542c), +0x18..+0x47
+		// analog sticks, +0x48 a word of another object. The buttons are predicted to stay held: pressed 0, repeat continued
+		// from the history. Copying the previous entry repeated its pressed bits - a sure rollback one frame after every
+		// press (~19 % of the mispredictions in the logs o130-o273). RB_ONLINE_PREDICT_HOLD=0: the previous entry copied.
+		entry_t predict_entry(u32 mgr, u32 i, u32 sim)
+		{
+			entry_t e = read_entry(slot_addr(mgr, i, sim - 1));
+			static const bool hold = !(std::getenv("RB_ONLINE_PREDICT_HOLD") && *std::getenv("RB_ONLINE_PREDICT_HOLD") == '0');
+
+			if (!hold)
+			{
+				return e;
+			}
+
+			for (u32 blk : {0x0u, 0xCu})
+			{
+				const u32 held = read_from_ptr<be_t<u32>>(e, blk);
+				u32 repeat = 0;
+
+				for (u32 bit = 1; bit; bit <<= 1)
+				{
+					if (!(held & bit))
+					{
+						continue;
+					}
+
+					// The newest repeat of this bit within its held run decides the next one (20 frames after the press, else 4)
+					for (u32 back = 1; back <= 20 && back <= sim; back++)
+					{
+						const u32 f = sim - back;
+
+						if (!(vm::read8(flag_addr(mgr, i, f)) & 1))
+						{
+							break;
+						}
+
+						const u32 slot = slot_addr(mgr, i, f) + blk;
+
+						if (!(vm::read32(slot) & bit))
+						{
+							break;
+						}
+
+						if (vm::read32(slot + 8) & bit)
+						{
+							repeat |= back == ((vm::read32(slot + 4) & bit) ? 20u : 4u) ? bit : 0;
+							break;
+						}
+					}
+				}
+
+				write_to_ptr<be_t<u32>>(e, blk + 4, be_t<u32>{0});
+				write_to_ptr<be_t<u32>>(e, blk + 8, be_t<u32>{repeat});
+			}
+
+			return e;
+		}
+
 		// GGPO rule: a local input never changes once created (it may already be sent; o94: after a rollback the sender's
 		// entries of already sent frames held other values, the peer simulated different inputs). New local entries are
 		// recorded (not during a re-simulation), recorded ones are written back where the ring differs.
@@ -551,7 +611,7 @@ namespace rb::online
 			if (config().predict && mode == 1 && in_fight() && ring_ready() && !g_sim_at.empty() && player == remote_player(mgr) && sim > 0 &&
 				((resim && sim <= g_resim_sim_limit) || (sim < available + config().max_predict && !too_old && !g_sync_hold && predict_game_mode())) && (vm::read8(flag_addr(mgr, i, sim - 1)) & 1))
 			{
-				const entry_t prev = read_entry(slot_addr(mgr, i, sim - 1));
+				const entry_t prev = predict_entry(mgr, i, sim);
 				std::memcpy(vm::get_super_ptr<u8>(slot_addr(mgr, i, sim)), prev.data(), entry_size);
 				vm::write8(flags, 1);
 				g_predicted[sim] = prev;
