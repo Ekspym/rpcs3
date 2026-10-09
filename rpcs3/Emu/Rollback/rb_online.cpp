@@ -180,6 +180,8 @@ namespace rb::online
 		u64 g_sync_last_hold = 0, g_sync_holds = 0;
 		u64 g_live_pred_count = 0, g_live_pred_depth = 0; // live predictions and their depth (frames beyond the available ones)
 		u64 g_predictions = 0, g_mispredictions = 0, g_rollbacks = 0, g_resim_frames = 0;
+		u32 g_press_scratch = 0;  // 2 x 0x80 bytes of guest memory for hle_get_input (allocated in install_hooks)
+		u64 g_press_fixed = 0;    // local entries whose pressed bits hle_get_input corrected
 		u64 g_dbg_get_remote = 0, g_dbg_get_missing = 0, g_dbg_store_remote = 0, g_dbg_store_local = 0;
 
 		// Main loop frame (game frame) -> remote simulated frame at its start
@@ -258,7 +260,7 @@ namespace rb::online
 		{
 			static fs::file out = []()
 			{
-				// UTF-8 path (std::getenv gives the ANSI code page: "Nová složka" would not open)
+				// UTF-8 path (std::getenv gives the ANSI code page: "NovĂˇ sloĹľka" would not open)
 #ifdef _WIN32
 				const wchar_t* wpath = _wgetenv(L"RB_ONLINE_HASH_OUT");
 				const std::string path = wpath ? wchar_to_utf8(wpath) : std::string();
@@ -425,14 +427,49 @@ namespace rb::online
 			const u32 avail = vm::read32(mgr + 0x58 + li * 4);
 			const u32 from = avail > 16 ? avail - 16 : 0;
 
+			// Diagnostics (double / lost presses, 2026-10-09): a new local entry whose pressed bits (+0x04) are not
+			// held & ~held of the previous local entry; logged with what happened since the previous entry
+			static u32 calls_since_new = 0;
+			static u32 rollbacks_at_prev = 0;
+			calls_since_new++;
+
 			if (!resim)
 			{
+				u32 added = 0;
+
 				for (u32 f = from; f < avail; f++)
 				{
 					if (!g_local.contains(f) && (vm::read8(flag_addr(mgr, li, f)) & 1))
 					{
 						g_local.emplace(f, std::pair{read_entry(slot_addr(mgr, li, f)), vm::read8(flag_addr(mgr, li, f))});
+						added++;
+
+						if (auto prev = g_local.find(f - 1); prev != g_local.end())
+						{
+							const auto word = [](const entry_t& e, u32 off) { return read_from_ptr<be_t<u32>>(e, off).value(); };
+							const u32 held = word(g_local[f].first, 0), pressed = word(g_local[f].first, 4), prev_held = word(prev->second.first, 0);
+							const u32 expected = held & ~prev_held;
+
+							if (pressed != expected)
+							{
+								static u32 logged = 0;
+								u32 seq[2]{};
+								get_seq(seq);
+
+								if (logged++ < 200)
+								{
+									rb_online_log.warning("Local press mismatch at frame %u (game frame %u): held 0x%x prev held 0x%x pressed 0x%x expected 0x%x; calls since previous new entry %u, entries added now %u, rollbacks since %u",
+										f, seq[0], held, prev_held, pressed, expected, calls_since_new, added, static_cast<u32>(g_rollbacks) - rollbacks_at_prev);
+								}
+							}
+						}
 					}
+				}
+
+				if (added)
+				{
+					calls_since_new = 0;
+					rollbacks_at_prev = static_cast<u32>(g_rollbacks);
 				}
 			}
 
@@ -499,6 +536,63 @@ namespace rb::online
 			if (b & 1)
 			{
 				vm::write8(flags, b | 2);
+
+				// RB_ONLINE_PRESS_FROM_HELD (default on): the fight copies held/pressed/repeat of this entry into its pad
+				// (FUN_00185cc8, the only caller) without recomputing them. The pressed bits come from the local pad step
+				// (held & ~held of the previous pad step), which is not the previous entry when an entry was dropped or
+				// built in a re-simulation: lost presses (held without pressed) and double presses (pressed while held)
+				// online, 2026-10-09. The fight gets pressed = held & ~held of the previous entry instead (both button
+				// sets, repeat adjusted the same way): the same on both instances, whatever the pad steps did.
+				static const bool from_held = !std::getenv("RB_ONLINE_PRESS_FROM_HELD") || *std::getenv("RB_ONLINE_PRESS_FROM_HELD") != '0';
+
+				if (from_held && mode == 1 && g_press_scratch && sim > 0)
+				{
+					// Previous held bits: the fight pad the caller copies into (FUN_00185cc8 keeps it in r31; pads 9/10 at
+					// +0x90 / +0x120 hold the last consumed entry). Not the ring entry of sim - 1: the ring is restored with the
+					// snapshot and only the frames from sim on are re-applied, so after a rollback that slot can still hold an
+					// old prediction (test pk8: the two instances computed different pressed bits, pk5/pk6 diverged).
+					const bool from_pad = ppu.lr == 0x00185d34 && vm::check_addr(static_cast<u32>(ppu.gpr[31]) + 0x120, vm::page_readable);
+					const u32 prev_entry = from_pad ? static_cast<u32>(ppu.gpr[31]) + 0x90 : vm::read32(mgr + i * 0x10 + 0x1c) + ((sim - 1) % ring) * entry_size;
+					const u32 prev_off2 = from_pad ? 0x90u : 0xcu;  // pad: +0x90 held, +0x120 mapped held (entry: +0x0, +0xc)
+					const u32 out = g_press_scratch + i * 0x80;
+					std::memcpy(vm::get_super_ptr<u8>(out), vm::get_super_ptr<u8>(entry), entry_size);
+					u32 changed = 0;
+
+					for (const u32 blk : {0u, 0xcu})
+					{
+						const u32 held = vm::read32(entry + blk), pressed = vm::read32(entry + blk + 4), repeat = vm::read32(entry + blk + 8);
+						const u32 prev_held = vm::read32(prev_entry + (blk ? prev_off2 : 0u));
+						const u32 new_pressed = held & ~prev_held;
+						vm::write32(out + blk + 4, new_pressed);
+						vm::write32(out + blk + 8, (repeat & ~pressed) | new_pressed);
+						changed |= pressed ^ new_pressed;
+					}
+
+					// RB_ONLINE_PRESS_LOG=1 (diagnostics): every read of the fight (compare the two instances)
+					if (static const bool plog = std::getenv("RB_ONLINE_PRESS_LOG") != nullptr; plog && in_fight())
+					{
+						static u32 n = 0;
+
+						if (n++ < 40000)
+						{
+							const u32 ring_prev = vm::read32(mgr + i * 0x10 + 0x1c) + ((sim - 1) % ring) * entry_size;
+							rb_online_log.notice("PRESSLOG p%u sim %u resim %d ringprev %x/%x held %x/%x prev %x/%x raw %x/%x/%x/%x out %x/%x/%x/%x", player, sim, is_resimulating(),
+								+vm::read32(ring_prev), +vm::read32(ring_prev + 0xc),
+								+vm::read32(entry), +vm::read32(entry + 0xc), +vm::read32(prev_entry), +vm::read32(prev_entry + prev_off2),
+								+vm::read32(entry + 4), +vm::read32(entry + 8), +vm::read32(entry + 0x10), +vm::read32(entry + 0x14),
+								+vm::read32(out + 4), +vm::read32(out + 8), +vm::read32(out + 0x10), +vm::read32(out + 0x14));
+						}
+					}
+
+					if (changed && player != remote_player(mgr) && !is_resimulating() && ++g_press_fixed % 50 == 1)
+					{
+						rb_online_log.notice("Pressed bits from held: %u local entries corrected so far (frame %u: pressed 0x%x -> 0x%x)", g_press_fixed, sim,
+							+vm::read32(entry + 4), +vm::read32(out + 4));
+					}
+
+					return out;
+				}
+
 				return entry;
 			}
 
@@ -2898,6 +2992,12 @@ namespace rb::online
 			return;
 		}
 
+		if (!g_press_scratch)
+		{
+			g_press_scratch = vm::alloc(0x1000, vm::main);
+			state_exclude(g_press_scratch, g_press_scratch + 0x1000, "pressed bits from held (hle_get_input copies)");
+		}
+
 		for (const auto& [addr, index] : {std::pair{0x004073f4u, s_get_input_index}, std::pair{0x00407fd4u, s_store_input_index},
 			std::pair{0x00407054u, s_available_index}, std::pair{0x0069afa0u, s_voice_stop_index}, std::pair{0x0069effcu, s_sound_bank_lookup_index}, std::pair{0x0068e108u, s_sound_play_index}, std::pair{0x0021bb94u, s_spurs_job_wait_index},
 			std::pair{0x0021bce8u, s_spurs_job_teardown_index}, std::pair{0x006b51dcu, s_at3p_decoder_destroy_index}, std::pair{0x0042371cu, s_input_message_read_index}, std::pair{0x005bb268u, s_shader_param_set_index}, std::pair{0x005bb0e8u, s_shader_param_set_b_index}})
@@ -2914,6 +3014,119 @@ namespace rb::online
 
 	bool resimulating = false;
 	u64 g_resim_until = 0; // game frame where the re-simulation reaches the frame of the rollback again
+
+	// Local controller pads (RB_ONLINE_PAD_KEEP, default the pad objects 2-8 0x00B06610-0x00B06F70 and their raw data
+	// 0x00B07270-0x00B07670): the game computes "pressed" there as held & ~held of the previous frame (FUN_0018520c).
+	// A rollback restored the old previous-frame state while the player's hand stayed in the present: the next live
+	// frame saw the press again (double press) or a new press as already held (lost press); ~90 % of both happened
+	// within 3 frames of a rollback (2026-10-09, Romania match). The bytes are taken before the load and written back
+	// when the re-simulation ends, so the pads see one continuous live sequence. The fight reads its pads 9/10 from the
+	// input manager entries (kept separately), not from these.
+	std::vector<std::pair<u32, std::vector<u8>>> g_pad_keep;
+
+	// Local frames available before the rollback (+0x58 of the local player): the re-simulation often simulates further
+	// than the original live frames did (remote inputs no longer missing), so the game adds a local entry during it,
+	// built from the pad state of the re-simulation - and the next live frame saw the same press again (double press,
+	// all 5 of test pk2 right after a rollback with two new local entries at once). Entries added during the
+	// re-simulation and not yet simulated are dropped when it ends; the live frame adds them from the live pads.
+	u32 g_resim_local_avail = umax;
+
+
+	// End of a re-simulation (both rollback paths): live pads back, local entries the re-simulation added dropped
+	void finish_resim_inputs(u32 mgr, u32 ri)
+	{
+		for (const auto& [addr, bytes] : g_pad_keep)
+		{
+			std::memcpy(vm::get_super_ptr<u8>(addr), bytes.data(), bytes.size());
+		}
+
+		g_pad_keep.clear();
+
+		// Off by default (RB_ONLINE_PRESS_FROM_HELD covers it; dropping made the pace uneven, test pk4): RB_ONLINE_RESIM_LOCAL_DROP=1
+		if (static const bool drop = std::getenv("RB_ONLINE_RESIM_LOCAL_DROP") && *std::getenv("RB_ONLINE_RESIM_LOCAL_DROP") == '1';
+			drop && mgr && g_resim_local_avail != umax)
+		{
+			const u32 li = 1 - ri;
+			const u32 avail = vm::read32(mgr + 0x58 + li * 4);
+			const u32 keep = std::max(g_resim_local_avail, +vm::read32(mgr + 0x60 + li * 4));
+
+			if (avail > keep)
+			{
+				for (u32 f = keep; f < avail; f++)
+				{
+					vm::write8(flag_addr(mgr, li, f), vm::read8(flag_addr(mgr, li, f)) & ~1);
+					g_local.erase(f);
+				}
+
+				vm::write32(mgr + 0x58 + li * 4, keep);
+				vm::write32(mgr + 0x68 + li * 4, std::min<u32>(vm::read32(mgr + 0x68 + li * 4), keep));
+
+				if (static u32 logged = 0; logged++ < 30)
+				{
+					rb_online_log.notice("Re-simulation added local entries %u-%u: dropped, the live frames add them from the live pads", keep, avail - 1);
+				}
+			}
+		}
+
+		g_resim_local_avail = umax;
+	}
+
+	const std::vector<std::pair<u32, u32>>& pad_keep_ranges();
+
+	// Before a load (both rollback paths): the live pads; a pending capture of an unfinished re-simulation is kept
+	void capture_live_inputs(u32 local_available)
+	{
+		if (g_pad_keep.empty())
+		{
+			for (const auto& [lo, hi] : pad_keep_ranges())
+			{
+				if (vm::check_addr(lo, vm::page_readable))
+				{
+					g_pad_keep.emplace_back(lo, std::vector<u8>(vm::get_super_ptr<u8>(lo), vm::get_super_ptr<u8>(lo) + (hi - lo)));
+				}
+			}
+		}
+
+		if (g_resim_local_avail == umax)
+		{
+			g_resim_local_avail = local_available;
+		}
+	}
+
+	const std::vector<std::pair<u32, u32>>& pad_keep_ranges()
+	{
+		static const std::vector<std::pair<u32, u32>> r = []()
+		{
+			std::vector<std::pair<u32, u32>> v;
+			const char* e = std::getenv("RB_ONLINE_PAD_KEEP");
+			// Off by default since RB_ONLINE_PRESS_FROM_HELD (hle_get_input) fixes the pressed bits where the fight reads them;
+			// RB_ONLINE_PAD_KEEP=1 = the pad ranges below
+			const std::string s = !e ? "0" : std::string(e) == "1" ? "0x00B06610-0x00B06F70,0x00B07270-0x00B07670" : e;
+
+			if (s == "0")
+			{
+				return v;
+			}
+
+			for (usz pos = 0; pos < s.size();)
+			{
+				const usz end = std::min(s.find(',', pos), s.size());
+				const std::string item = s.substr(pos, end - pos);
+				const usz dash = item.find('-');
+
+				if (dash != umax)
+				{
+					v.emplace_back(static_cast<u32>(std::strtoul(item.substr(0, dash).c_str(), nullptr, 16)),
+						static_cast<u32>(std::strtoul(item.substr(dash + 1).c_str(), nullptr, 16)));
+				}
+
+				pos = end + 1;
+			}
+
+			return v;
+		}();
+		return r;
+	}
 
 	bool fight_active()
 	{
@@ -3344,6 +3557,7 @@ namespace rb::online
 
 				local->available = vm::read32(mgr + 0x58 + li * 4);
 				local->sent = vm::read32(mgr + 0x68 + li * 4);
+				capture_live_inputs(local->available);
 
 				for (u32 f = local->available > 32 ? local->available - 32 : 0; f < local->available; f++)
 				{
@@ -3825,6 +4039,20 @@ namespace rb::online
 		const config_t& cfg = config();
 		const u32 mgr = manager();
 
+		// First live boundary after a re-simulation of the stress ring path (rb_state loaded the state in frame_boundary
+		// before this call): live pads back, local entries added by the re-simulation dropped
+		if (static bool was_resim = false; true)
+		{
+			const bool now = is_resimulating();
+
+			if (was_resim && !now && (!g_pad_keep.empty() || g_resim_local_avail != umax))
+			{
+				finish_resim_inputs(mgr, mgr ? remote_player(mgr) - 1 : 0);
+			}
+
+			was_resim = now;
+		}
+
 		game_mode_frame();
 		sound_frame();
 
@@ -4202,6 +4430,8 @@ namespace rb::online
 			resimulating = false;
 			state_net_set_resim(false);
 
+			finish_resim_inputs(mgr, ri);
+
 			if (game_frame != g_resim_until)
 			{
 				rb_online_log.error("Re-simulation ended at game frame %u instead of %u", game_frame, g_resim_until);
@@ -4483,6 +4713,8 @@ namespace rb::online
 						std::memcpy(p.buf.data(), vm::get_super_ptr<u8>(addr), 4096);
 					}
 				}
+
+				capture_live_inputs(local_available);
 
 				if (target != umax && game_frame - target <= max_resim() && state_net_load(target, info))
 				{

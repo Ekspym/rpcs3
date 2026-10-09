@@ -766,7 +766,10 @@ namespace rb
 		// so this only moves the wait earlier; render data restored after it is not in use by the draw thread.
 		u64 g_wait_us_idle_total = 0, g_wait_us_idle_max = 0;
 
-		void wait_for_draw_idle()
+		// for_save: the wait before a save (every live frame). RB_DRAW_IDLE_RSX=2 applies the RSX criterion below only to
+		// these: a save does not change guest memory, so the RSX still reading the render buffers does not matter; a load
+		// keeps the full wait (RB_DRAW_IDLE_RSX=1 for loads too gave visual artifacts online, v1.2.1)
+		void wait_for_draw_idle(bool for_save = false)
 		{
 			const diag_scope diag(diag_t::draw_wait);
 
@@ -789,7 +792,8 @@ namespace rb
 			// RSX semaphore after the frame's commands and waits for the GPU): its work on the frame is done, only the RSX
 			// still reads the render buffers (o248: every wait over 2 ms had the thread there). The request state +0xA8 is
 			// cleared only after that GPU wait (~7-12 ms per frame of the waits before).
-			static const bool idle_rsx = std::getenv("RB_DRAW_IDLE_RSX") && *std::getenv("RB_DRAW_IDLE_RSX") == '1';
+			static const char idle_rsx_mode = std::getenv("RB_DRAW_IDLE_RSX") ? *std::getenv("RB_DRAW_IDLE_RSX") : '0';
+			const bool idle_rsx = idle_rsx_mode == '1' || (idle_rsx_mode == '2' && for_save);
 			static u32 draw_tid = 0;
 
 			const auto draw_waits_for_rsx = [&]() -> bool
@@ -2165,7 +2169,7 @@ namespace rb
 
 		if (save_idle && !g_net_resim)
 		{
-			wait_for_draw_idle();
+			wait_for_draw_idle(true);
 		}
 
 		if (g_cal_continuous && g_cal_done && calibrate_step())
@@ -2465,7 +2469,7 @@ namespace rb
 					}
 				}
 
-				wait_for_draw_idle();
+				wait_for_draw_idle(true);
 
 				if (idle_diff)
 				{
