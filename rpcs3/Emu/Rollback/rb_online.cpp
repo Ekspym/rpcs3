@@ -590,7 +590,8 @@ namespace rb::online
 							+vm::read32(entry + 4), +vm::read32(out + 4));
 					}
 
-					return out;
+					// Only a corrected entry is handed over as a copy (the fight may use the ring entry beyond the copy)
+					return changed ? out : entry;
 				}
 
 				return entry;
