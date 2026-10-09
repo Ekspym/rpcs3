@@ -93,6 +93,8 @@ namespace rb
 	int state_addr_saved(u32 addr);
 
 	bool on_write_fault(u32 addr);
+	// RB_RSX_READS=2 (diagnostics): access to an RSX-read snapshot page during a re-simulation
+	bool on_guard_fault(u32 addr, bool is_writing);
 	void note_write(u32 addr, u32 size);
 	// A file read into guest memory (lv2_file::op_read, written through the host view without a fault)
 	void note_file_read(u32 addr, u64 size);

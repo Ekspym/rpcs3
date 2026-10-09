@@ -1554,6 +1554,11 @@ bool handle_access_violation(u32 addr, bool is_writing, bool is_exec, ucontext_t
 	g_tls_fault_all++;
 
 	// Rollback snapshot write tracking: first write to a tracked read-only page
+	if (!is_exec && rb::on_guard_fault(addr, is_writing))
+	{
+		return true;
+	}
+
 	if (!is_exec && rb::on_write_fault(addr))
 	{
 		return true;

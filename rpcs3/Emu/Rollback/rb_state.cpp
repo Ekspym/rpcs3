@@ -10,6 +10,7 @@
 #include "Emu/IdManager.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/RSX/RSXThread.h"
+#include "Emu/RSX/Capture/rsx_capture.h"
 #include "Utilities/StrUtil.h"
 #include "util/vm.hpp"
 
@@ -765,6 +766,7 @@ namespace rb
 		// previous frame. The main thread waits for the same condition later in the frame anyway (FUN_005c0944),
 		// so this only moves the wait earlier; render data restored after it is not in use by the draw thread.
 		u64 g_wait_us_idle_total = 0, g_wait_us_idle_max = 0;
+		bool g_wait_rsx_ok = false; // this wait may end once the draw thread only waits for the GPU (RB_RSX_HOLD load)
 
 		// for_save: the wait before a save (every live frame). RB_DRAW_IDLE_RSX=2 applies the RSX criterion below only to
 		// these: a save does not change guest memory, so the RSX still reading the render buffers does not matter; a load
@@ -793,7 +795,7 @@ namespace rb
 			// still reads the render buffers (o248: every wait over 2 ms had the thread there). The request state +0xA8 is
 			// cleared only after that GPU wait (~7-12 ms per frame of the waits before).
 			static const char idle_rsx_mode = std::getenv("RB_DRAW_IDLE_RSX") ? *std::getenv("RB_DRAW_IDLE_RSX") : '0';
-			const bool idle_rsx = idle_rsx_mode == '1' || (idle_rsx_mode == '2' && for_save);
+			const bool idle_rsx = idle_rsx_mode == '1' || (idle_rsx_mode == '2' && for_save) || g_wait_rsx_ok;
 			static u32 draw_tid = 0;
 
 			const auto draw_waits_for_rsx = [&]() -> bool
@@ -1378,6 +1380,9 @@ namespace rb
 			}
 		}
 
+		// Load only: pages left as they are (RB_RSX_HOLD: the pages the RSX reads)
+		const std::unordered_map<u32, u64>* skip_pages = nullptr;
+
 		template <bool Save>
 		void copy(u32 slot)
 		{
@@ -1412,6 +1417,14 @@ namespace rb
 				if (!vm::check_addr(u.page, vm::page_readable))
 				{
 					continue;
+				}
+
+				if constexpr (!Save)
+				{
+					if (skip_pages && skip_pages->count(u.page))
+					{
+						continue;
+					}
 				}
 
 				u8* guest = vm::get_super_ptr<u8>(u.page);
@@ -1479,6 +1492,528 @@ namespace rb
 	};
 
 	static page_store g_store;
+
+	// RB_RSX_READS=1 (diagnostics): before every online load, which snapshot pages the RSX reads (rsx_capture.cpp collects
+	// them per draw) the load would change - those tear the frame the RSX may still be drawing when the load does not
+	// wait for it (RB_DRAW_IDLE_RSX=1). Logged every 300 loads as ranges: loads that changed the range / draws reading it.
+	// Second part: RSX-read pages (in or out of the snapshot) written between the load and the end of the re-simulation -
+	// the re-simulated frames write them while the RSX may still read them
+	static std::map<u32, u64> g_rsx_before;
+	static std::map<u32, u32> g_rsx_read_pages_all;
+	static bool g_rsx_guard_pending = false;
+	static std::map<u32, u32> g_rsx_resim_changed;
+
+	static u64 rsx_page_hash(u32 page)
+	{
+		const u64* p = reinterpret_cast<const u64*>(vm::get_super_ptr<u8>(page));
+		u64 h = 0xcbf29ce484222325;
+
+		for (u32 i = 0; i < 512; i++)
+		{
+			h = (h ^ p[i]) * 0x100000001b3;
+		}
+
+		return h;
+	}
+
+	// RB_RSX_READS=2: the RSX-read pages of the snapshot are made inaccessible from the load to the end of the
+	// re-simulation; every first access (thread, code address, read / write) is counted - what the re-simulation needs
+	// of them or writes into them (a load that leaves them to the RSX must know)
+	static std::atomic<bool> g_guard_active{false};
+	static std::mutex g_guard_mutex;
+	static std::set<u32> g_guard_pages;
+	static std::map<std::string, u32> g_guard_hits;
+	static std::map<u32, u32> g_guard_page_hits;
+	static u64 g_guard_total = 0;
+
+	static void guard_release(u32 page)
+	{
+		if (vm::check_addr(page, vm::page_readable))
+		{
+			const bool clean = g_track_active && g_track && g_track[page >> 12].load() == track_clean;
+			utils::memory_protect(vm::g_base_addr + page, 0x1000, clean ? utils::protection::ro : utils::protection::rw);
+		}
+	}
+
+	static void guard_end()
+	{
+		std::lock_guard lock(g_guard_mutex);
+
+		for (const u32 page : g_guard_pages)
+		{
+			guard_release(page);
+		}
+
+		g_guard_pages.clear();
+		g_guard_active = false;
+	}
+
+	static bool hold_fault(u32 addr, bool is_writing);
+
+	bool on_guard_fault(u32 addr, bool is_writing)
+	{
+		if (hold_fault(addr, is_writing))
+		{
+			return true;
+		}
+
+		if (!g_guard_active)
+		{
+			return false;
+		}
+
+		std::lock_guard lock(g_guard_mutex);
+		const u32 page = addr & ~0xfffu;
+
+		if (!g_guard_pages.erase(page))
+		{
+			return false;
+		}
+
+		std::string who;
+		const auto cpu = cpu_thread::get_current();
+
+		if (cpu && cpu->get_class() == thread_class::ppu)
+		{
+			const auto& ppu = *static_cast<ppu_thread*>(cpu);
+			const auto name = ppu.ppu_tname.load();
+			who = fmt::format("%s cia 0x%08x lr 0x%08x", cpu->id == 0x1000000 ? "main" : name ? name->c_str() : "ppu", ppu.cia, static_cast<u32>(ppu.lr));
+		}
+		else
+		{
+			who = std::string(thread_ctrl::get_name());
+		}
+
+		g_guard_hits[fmt::format("%s %s", is_writing ? "W" : "R", who)]++;
+		g_guard_page_hits[page]++;
+		guard_release(page);
+		return true;
+	}
+
+	static void rsx_reads_resim_end()
+	{
+		guard_end();
+		for (const auto& [page, h] : g_rsx_before)
+		{
+			if (vm::check_addr(page, vm::page_readable) && rsx_page_hash(page) != h)
+			{
+				g_rsx_resim_changed[page]++;
+			}
+		}
+
+		g_rsx_before.clear();
+	}
+
+	// RB_RSX_HOLD=1: online rollback without waiting for the RSX (players' logs 2026-10-10: the wait before the load was
+	// ~11 ms per rollback = nearly every rollback dropped a frame). The draw thread is done with the frame once it waits
+	// for the GPU (FUN_005fa558, wait_for_draw_idle RSX criterion); what the RSX still reads of the snapshot are render
+	// outputs (skinned vertex data etc., ~340 pages changed per load, tests fd1-fd3) that the fight logic never touches
+	// in a re-simulation (guard test fd3: 0 accesses of the main thread in 300 rollbacks). So:
+	// - the pages the RSX read in the last 2 s (rsx_capture.cpp, sampled) are not restored by an online load;
+	// - while the RSX is still busy after the load they are write-protected: a writer (SPU job of a re-simulated frame,
+	//   ~3 % of the rollbacks) waits in the fault handler until the RSX is done; the hold ends with the re-simulation.
+	// The set is dropped at every game mode change (round transitions free and reuse memory).
+	static const bool g_rsx_hold = []() { const char* v = std::getenv("RB_RSX_HOLD"); return v && *v == '1'; }();
+	static std::unordered_map<u32, u64> g_hold_recent; // page -> time (ms) the RSX last read it
+	static std::atomic<bool> g_hold_active{false};
+	static std::mutex g_hold_mutex;
+	static std::vector<u32> g_hold_pages; // write-protected now
+	static u64 g_hold_waits = 0, g_hold_wait_us = 0, g_hold_loads = 0, g_hold_busy_loads = 0, g_hold_skipped = 0;
+	static std::map<std::string, std::pair<u32, u64>> g_hold_who; // writer -> waits, us
+
+	// Game mode of the battle (mode state *0x00967cf4 + 0xc, recordsnalysis_game_modes.md); 4 = fight
+	static u32 hold_game_mode()
+	{
+		const u32 base = vm::check_addr<4>(0x00967cf4, vm::page_readable) ? static_cast<u32>(vm::read32(0x00967cf4)) : 0u;
+		return base && vm::check_addr<4>(base + 0xc, vm::page_readable) ? static_cast<u32>(vm::read32(base + 0xc)) : u32{umax};
+	}
+
+	static u64 hold_now_ms()
+	{
+		return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	}
+
+	static bool hold_draw_idle()
+	{
+		static const u32 addr = []() -> u32
+		{
+			const char* v = std::getenv("RB_SNAP_IDLE_WAIT");
+			return v && *v ? static_cast<u32>(std::strtoul(v, nullptr, 16)) : 0;
+		}();
+
+		return !addr || !vm::check_addr<8>(addr, vm::page_readable) || *vm::get_super_ptr<u64>(addr) == 0u;
+	}
+
+	// Main thread, every frame boundary: new RSX reads, old ones forgotten
+	static void hold_update()
+	{
+		if (!g_rsx_hold)
+		{
+			return;
+		}
+
+		const u64 now = hold_now_ms();
+
+		for (const auto& [page, n] : rsx::capture::rb_take_read_pages())
+		{
+			g_hold_recent[page] = now;
+		}
+
+		static u32 last_mode = umax;
+
+		if (const u32 mode = hold_game_mode(); mode != last_mode)
+		{
+			last_mode = mode;
+			g_hold_recent.clear();
+		}
+
+		if (static u32 n = 0; ++n % 64 == 0)
+		{
+			std::erase_if(g_hold_recent, [&](const auto& e) { return now - e.second > 2000; });
+		}
+	}
+
+	static void hold_release_locked()
+	{
+		for (const u32 page : g_hold_pages)
+		{
+			if (vm::check_addr(page, vm::page_readable))
+			{
+				const bool clean = g_track_active && g_track && g_track[page >> 12].load() == track_clean;
+				utils::memory_protect(vm::g_base_addr + page, 0x1000, clean ? utils::protection::ro : utils::protection::rw);
+			}
+		}
+
+		g_hold_pages.clear();
+		g_hold_active = false;
+	}
+
+	// Main thread, frame boundaries: the RSX is done -> writers are free again
+	static void hold_check()
+	{
+		if (g_hold_active && hold_draw_idle())
+		{
+			std::lock_guard lock(g_hold_mutex);
+			hold_release_locked();
+		}
+	}
+
+	// After an online load that did not wait for the RSX
+	static void hold_begin()
+	{
+		std::lock_guard lock(g_hold_mutex);
+		hold_release_locked();
+		g_hold_loads++;
+
+		if (!hold_draw_idle())
+		{
+			g_hold_busy_loads++;
+
+			for (const auto& [page, t] : g_hold_recent)
+			{
+				if (g_store.index.count(page) && vm::check_addr(page, vm::page_readable))
+				{
+					g_hold_pages.push_back(page);
+				}
+			}
+
+			std::sort(g_hold_pages.begin(), g_hold_pages.end());
+
+			for (usz i = 0; i < g_hold_pages.size();)
+			{
+				usz j = i + 1;
+
+				while (j < g_hold_pages.size() && g_hold_pages[j] == g_hold_pages[j - 1] + 0x1000)
+				{
+					j++;
+				}
+
+				utils::memory_protect(vm::g_base_addr + g_hold_pages[i], (j - i) * 0x1000, utils::protection::ro);
+				i = j;
+			}
+
+			g_hold_skipped += g_hold_pages.size();
+			g_hold_active = !g_hold_pages.empty();
+		}
+
+		if (g_hold_loads % 300 == 0)
+		{
+			rb_log.notice("RSX hold (300 loads): %u with the RSX still busy, %u pages held per such load, %u writers waited (avg %u us), %u pages in the RSX set",
+				g_hold_busy_loads, g_hold_skipped / std::max<u64>(g_hold_busy_loads, 1), g_hold_waits, g_hold_wait_us / std::max<u64>(g_hold_waits, 1), g_hold_recent.size());
+			std::string text;
+
+			for (const auto& [who, w] : g_hold_who)
+			{
+				fmt::append(text, " [%s: %u x, avg %u us]", who, w.first, w.second / std::max<u32>(w.first, 1));
+			}
+
+			rb_log.notice("RSX hold writers:%s", text);
+			g_hold_who.clear();
+			g_hold_busy_loads = g_hold_skipped = g_hold_waits = g_hold_wait_us = 0;
+		}
+	}
+
+	// Any thread: write fault on a held page -> wait for the RSX (at most 100 ms), then all held pages are free
+	static bool hold_fault(u32 addr, bool is_writing)
+	{
+		if (!g_hold_active || !is_writing)
+		{
+			return false;
+		}
+
+		{
+			std::lock_guard lock(g_hold_mutex);
+
+			if (!std::binary_search(g_hold_pages.begin(), g_hold_pages.end(), addr & ~0xfffu))
+			{
+				return false;
+			}
+		}
+
+		// Who writes (logged with the statistics)
+		std::string who;
+		const auto cpu = cpu_thread::get_current();
+
+		if (cpu && cpu->get_class() == thread_class::ppu)
+		{
+			const auto& ppu = *static_cast<ppu_thread*>(cpu);
+			const auto name = ppu.ppu_tname.load();
+			who = fmt::format("%s cia 0x%08x lr 0x%08x", cpu->id == 0x1000000 ? "main" : name ? name->c_str() : "ppu", ppu.cia, static_cast<u32>(ppu.lr));
+		}
+		else
+		{
+			who = std::string(thread_ctrl::get_name());
+		}
+
+		// Only the game's threads wait: the RSX thread (or any host thread) would wait for itself
+		const bool game_thread = cpu && (cpu->get_class() == thread_class::ppu || cpu->get_class() == thread_class::spu);
+		const auto start = std::chrono::steady_clock::now();
+
+		// The waiting thread counts as waiting for the emulator (the RSX thread pauses the cpu threads for some of its
+		// work: without the flag it waited for this thread and this thread for it - test hd2: 28 ms per wait)
+		if (game_thread)
+		{
+			cpu->state += cpu_flag::wait;
+		}
+
+		while (game_thread && g_hold_active && !hold_draw_idle() && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(100))
+		{
+			std::this_thread::sleep_for(std::chrono::microseconds(100));
+		}
+
+		if (game_thread)
+		{
+			cpu->state -= cpu_flag::wait;
+		}
+
+		std::lock_guard lock(g_hold_mutex);
+
+		if (g_hold_active)
+		{
+			const u64 us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+			g_hold_waits++;
+			g_hold_wait_us += us;
+			auto& w = g_hold_who[who];
+			w.first++;
+			w.second += us;
+			hold_release_locked();
+		}
+
+		return true;
+	}
+
+	static void rsx_reads_check(u32 slot)
+	{
+		if (!rsx::capture::rb_reads_enabled())
+		{
+			return;
+		}
+
+		static std::map<u32, u32>& read_pages = g_rsx_read_pages_all;
+		static std::map<u32, u32> changed;
+		static u64 loads = 0;
+
+		for (const auto& [page, n] : rsx::capture::rb_take_read_pages())
+		{
+			read_pages[page] += n;
+		}
+
+		for (const auto& [page, n] : read_pages)
+		{
+			const auto found = g_store.index.find(page);
+
+			if (found != g_store.index.end() && vm::check_addr(page, vm::page_readable) &&
+				std::memcmp(vm::get_super_ptr<u8>(page), g_store.units[found->second].data + slot * 0x1000ull, 0x1000) != 0)
+			{
+				changed[page]++;
+			}
+		}
+
+		if (++loads % 300 == 0)
+		{
+			u32 in_snap = 0, excluded = 0;
+
+			for (const auto& [page, n] : read_pages)
+			{
+				const int st = state_addr_saved(page);
+				in_snap += st == 1;
+				excluded += st == 2;
+			}
+
+			std::string text;
+			u32 begin = 0, end = 0, peak = 0;
+			u64 draws = 0;
+
+			const auto flush = [&]()
+			{
+				if (end)
+				{
+					fmt::append(text, " 0x%08x-0x%08x(%u/%u)", begin, end, peak, draws);
+				}
+			};
+
+			for (const auto& [page, n] : changed)
+			{
+				if (page != end)
+				{
+					flush();
+					begin = page;
+					peak = 0;
+					draws = 0;
+				}
+
+				end = page + 0x1000;
+				peak = std::max(peak, n);
+				draws += read_pages.count(page) ? read_pages[page] : 0;
+			}
+
+			flush();
+			rb_log.notice("RSX reads (%u loads): %u pages read by the RSX, %u in the snapshot, %u excluded; changed by loads (loads/draws):%s",
+				loads, read_pages.size(), in_snap, excluded, text);
+			changed.clear();
+
+			text.clear();
+			begin = end = peak = 0;
+			draws = 0;
+
+			for (const auto& [page, n] : g_rsx_resim_changed)
+			{
+				if (page != end)
+				{
+					flush();
+					begin = page;
+					peak = 0;
+					draws = 0;
+				}
+
+				end = page + 0x1000;
+				peak = std::max(peak, n);
+				draws += read_pages.count(page) ? read_pages[page] : 0;
+			}
+
+			flush();
+			rb_log.notice("RSX reads (%u loads): %u pages written during the re-simulations (rollbacks/draws):%s", loads, g_rsx_resim_changed.size(), text);
+			g_rsx_resim_changed.clear();
+		}
+
+		// After the load (the caller copies next; the excluded pages do not change by it): the content the re-simulation starts with
+		g_rsx_before.clear();
+
+		for (const auto& [page, n] : read_pages)
+		{
+			if (state_addr_saved(page) != 1 && vm::check_addr(page, vm::page_readable))
+			{
+				g_rsx_before[page] = rsx_page_hash(page);
+			}
+		}
+
+		static const bool guard = []() { const char* v = std::getenv("RB_RSX_READS"); return v && *v == '2'; }();
+
+		if (guard)
+		{
+			if (loads % 300 == 0)
+			{
+				std::lock_guard lock(g_guard_mutex);
+				std::vector<std::pair<u32, std::string>> top;
+
+				for (const auto& [who, n] : g_guard_hits)
+				{
+					top.emplace_back(n, who);
+				}
+
+				std::sort(top.rbegin(), top.rend());
+				std::string text;
+
+				for (usz i = 0; i < top.size() && i < 40; i++)
+				{
+					fmt::append(text, "\n  %6u %s", top[i].first, top[i].second);
+				}
+
+				u32 begin = 0, end = 0, peak = 0;
+
+				const auto flush = [&]()
+				{
+					if (end)
+					{
+						fmt::append(text, " 0x%08x-0x%08x(%u)", begin, end, peak);
+					}
+				};
+
+				text += "\n  pages:";
+
+				for (const auto& [page, n] : g_guard_page_hits)
+				{
+					if (page != end)
+					{
+						flush();
+						begin = page;
+						peak = 0;
+					}
+
+					end = page + 0x1000;
+					peak = std::max(peak, n);
+				}
+
+				flush();
+				rb_log.notice("RSX reads guard (%u loads, %u pages guarded in total): first accesses during the re-simulations:%s", loads, g_guard_total, text);
+				g_guard_hits.clear();
+				g_guard_page_hits.clear();
+				g_guard_total = 0;
+			}
+
+			g_rsx_guard_pending = true;
+		}
+	}
+
+	// After the load's copy: guard the RSX-read snapshot pages (see on_guard_fault)
+	static void rsx_reads_after_load()
+	{
+		if (!std::exchange(g_rsx_guard_pending, false))
+		{
+			return;
+		}
+
+		std::lock_guard lock(g_guard_mutex);
+
+		for (const u32 page : g_guard_pages)
+		{
+			guard_release(page);
+		}
+
+		g_guard_pages.clear();
+
+		for (const auto& [page, n] : g_rsx_read_pages_all)
+		{
+			if (g_store.index.count(page) && vm::check_addr(page, vm::page_readable))
+			{
+				g_guard_pages.insert(page);
+				utils::memory_protect(vm::g_base_addr + page, 0x1000, utils::protection::no);
+			}
+		}
+
+		g_guard_total += g_guard_pages.size();
+		g_guard_active = true;
+	}
 
 	// Cooling (with write tracking): a calibrated page that is identical in every ring slot and in guest memory is
 	// not changing any more (e.g. a buffer filled once during the round intro). It is dropped from the snapshot
@@ -2339,6 +2874,9 @@ namespace rb
 			// too: before, only state_net_save removed them and the stress ring kept restoring them
 			remove_foreign_pages();
 
+			hold_update();
+			hold_check();
+
 			// RB_SNAP_SAVE_IDLE=1: the draw thread must not be writing render data while the state is hashed
 			// (calibration) and saved; waiting between the two would let it change pages after their hash
 			static const bool save_idle = []() { const char* v = std::getenv("RB_SNAP_SAVE_IDLE"); return v && *v == '1'; }();
@@ -2542,6 +3080,16 @@ namespace rb
 			if (g_resim_start.time_since_epoch().count() && game_frame == g_last_rollback_from)
 			{
 				const u64 us = elapsed_us(g_resim_start);
+				rsx_reads_resim_end();
+
+				// RB_RSX_HOLD: the live frame writes its render data as in any frame (the game's own double buffering); test
+				// hd2: held into the live frame, its render preparation (0x006093a8 from 0x005b894c) waited in 17 % of the rollbacks
+				if (g_hold_active)
+				{
+					std::lock_guard lock(g_hold_mutex);
+					hold_release_locked();
+				}
+
 				rollback_csv(fmt::format("E,%u", us));
 				g_resim_start = {};
 				native::sample_gate(false);
@@ -2650,9 +3198,14 @@ namespace rb
 						g_request_before();
 					}
 
+					// RB_RSX_HOLD: fight (game mode 4) only - from the KO on the re-simulated frames draw in full
+					const bool hold = g_rsx_hold && hold_game_mode() == 4;
+
 					if (!fast_rollback && !g_idle_learned)
 					{
+						g_wait_rsx_ok = hold;
 						wait_for_draw_idle();
+						g_wait_rsx_ok = false;
 						wait_for_flip();
 					}
 
@@ -2660,13 +3213,23 @@ namespace rb
 					g_resim_start = start;
 					native::sample_gate(true);
 					g_resim_depth = static_cast<u32>(game_frame - to);
+					rsx_reads_check(to_slot);
 					online::sound_runtime_before_load();
 					film_save();
+					g_store.skip_pages = hold ? &g_hold_recent : nullptr;
 					g_store.copy<false>(to_slot);
+					g_store.skip_pages = nullptr;
+
+					if (hold)
+					{
+						hold_begin();
+					}
+
 					film_restore();
 					task_check(to, "after load");
 					film_undo_after_load(to);
 					online::sound_runtime_after_load();
+					rsx_reads_after_load();
 
 					// Snapshots after the restored frame belong to the discarded timeline (online mode saves no boundary
 					// during the re-simulation, so they would otherwise stay valid for a second rollback)

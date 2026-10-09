@@ -487,11 +487,39 @@ namespace rb
 		// Online rollback: port 0 (the local player) of re-simulated frames gets the data of the original frame
 		static std::map<u32, CellPadData> local_record;
 
+		// RB_ONLINE_PADTRACE=1 (diagnostics, double presses 2026-10-10): every read of port 0 in the online fight
+		static const bool pad_trace = std::getenv("RB_ONLINE_PADTRACE") != nullptr;
+		static u32 trace_n = 0;
+
+		// The pad state of the engine is not rolled back (RB_SNAP_EXCLUDE 0x00D2A400-0x00D2AA40, v1.2.3), so the recorded
+		// reads must not be replayed into it: a re-simulation replayed an older report (e.g. the press) over the newest
+		// one (the release, read by the frame that was then rolled back), and the read after the re-simulation said "no
+		// change" (len 0) - the release was lost: phantom second press / stuck button until the next change (test pt1,
+		// players' logs 2026-10-10: 12-14 % of the presses). Now: re-simulated frames read "no change", and the first live
+		// read after a re-simulation reports the last real state in full (len 24).
+		// RB_ONLINE_PAD_RESIM_REPLAY=1: the old replay of the recorded reads.
+		static const bool resim_replay = std::getenv("RB_ONLINE_PAD_RESIM_REPLAY") && *std::getenv("RB_ONLINE_PAD_RESIM_REPLAY") == '1';
+		static CellPadData last_full{};
+		static bool last_full_valid = false, reassert = false;
+
 		if (port_no == 0 && online::is_resimulating())
 		{
-			if (auto found = local_record.find(seq); found != local_record.end())
+			const auto found = local_record.find(seq);
+
+			if (!resim_replay)
+			{
+				data->len = 0;
+				reassert = true;
+			}
+			else if (found != local_record.end())
 			{
 				std::memcpy(data, &found->second, sizeof(CellPadData));
+			}
+
+			if (pad_trace && online::fight_active() && trace_n++ < 200000)
+			{
+				rb_log.notice("PADTRACE read seq %u game frame %u RESIM %s len %d d1 %x d2 %x", seq, g_state.seq[0], found != local_record.end() ? "record" : "MISSING",
+					+data->len, +data->button[CELL_PAD_BTN_OFFSET_DIGITAL1], +data->button[CELL_PAD_BTN_OFFSET_DIGITAL2]);
 			}
 
 			return;
@@ -501,7 +529,25 @@ namespace rb
 		if (port_no == 0)
 		{
 			apply_pad_commands(data);
+
+			if (data->len > 0)
+			{
+				std::memcpy(&last_full, data, sizeof(CellPadData));
+				last_full_valid = true;
+			}
+			else if (reassert && last_full_valid && !resim_replay)
+			{
+				std::memcpy(data, &last_full, sizeof(CellPadData));
+			}
+
+			reassert = false;
 			std::memcpy(&local_record[seq], data, sizeof(CellPadData));
+
+			if (pad_trace && online::fight_active() && trace_n++ < 200000)
+			{
+				rb_log.notice("PADTRACE read seq %u game frame %u live len %d d1 %x d2 %x", seq, g_state.seq[0],
+					+data->len, +data->button[CELL_PAD_BTN_OFFSET_DIGITAL1], +data->button[CELL_PAD_BTN_OFFSET_DIGITAL2]);
+			}
 
 			while (local_record.size() > 240)
 			{

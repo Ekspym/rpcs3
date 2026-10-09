@@ -975,6 +975,11 @@ namespace rsx
 			capture::capture_draw_memory(this);
 		}
 
+		if (capture::rb_reads_enabled())
+		{
+			capture::rb_note_draw_reads(this);
+		}
+
 		in_begin_end = false;
 		m_frame_stats.draw_calls++;
 

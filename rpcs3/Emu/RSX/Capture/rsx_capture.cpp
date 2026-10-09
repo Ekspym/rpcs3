@@ -6,6 +6,11 @@
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/Memory/vm.h"
 
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <set>
+
 namespace rsx
 {
 	namespace capture
@@ -34,6 +39,189 @@ namespace rsx
 
 				mem_changes.insert(block_hash);
 			}
+		}
+
+		// RB_RSX_READS=1 (rollback diagnostics): which main memory pages the RSX reads while it draws a frame - a rollback that
+		// restores them before the RSX is done tears the frame (RB_DRAW_IDLE_RSX=1 for loads gave visual artifacts)
+		static std::mutex g_rb_reads_mutex;
+		static std::map<u32, u32> g_rb_reads;
+
+		bool rb_reads_enabled()
+		{
+			// RB_RSX_READS=1/2: diagnostics, every draw. RB_RSX_HOLD=1 (rollback without waiting for the RSX): the draws of
+			// a 25 ms window every 200 ms (at least one whole frame; the analysis costs about as much as the draw's upload)
+			static const bool diag = []() { const char* v = std::getenv("RB_RSX_READS"); return v && (*v == '1' || *v == '2'); }();
+			static const bool hold = []() { const char* v = std::getenv("RB_RSX_HOLD"); return v && *v == '1'; }();
+
+			if (diag)
+			{
+				return true;
+			}
+
+			if (!hold)
+			{
+				return false;
+			}
+
+			static std::chrono::steady_clock::time_point window{};
+			const auto now = std::chrono::steady_clock::now();
+
+			if (now - window >= std::chrono::milliseconds(200))
+			{
+				window = now;
+			}
+
+			return now - window < std::chrono::milliseconds(25);
+		}
+
+		void rb_note_draw_reads(thread* rsx)
+		{
+			std::set<u32> pages;
+
+			const auto note = [&](u32 addr, u64 size)
+			{
+				if (addr >= 0xC0000000u || !size || size > 0x4000000)
+				{
+					return;
+				}
+
+				for (u64 a = addr & ~0xfffu; a < u64{addr} + size && a < 0xC0000000u; a += 0x1000)
+				{
+					pages.insert(static_cast<u32>(a));
+				}
+			};
+
+			if (rsx->ctrl)
+			{
+				const u32 get = rsx->iomap_table.get_addr(rsx->ctrl->get);
+
+				if (get != umax)
+				{
+					note(get, 4);
+				}
+			}
+
+			const auto [program_offset, program_location] = method_registers.shader_program_address();
+			const u32 program_addr = get_address(program_offset, program_location);
+
+			if (program_addr < 0xC0000000u)
+			{
+				const auto info = program_hash_util::fragment_program_utils::analyse_fragment_program(vm::base(program_addr));
+				note(program_addr, info.program_start_offset + info.program_ucode_length);
+			}
+
+			const auto note_texture = [&](const auto& tex)
+			{
+				if (!tex.enabled())
+				{
+					return;
+				}
+
+				const u32 texaddr = get_address(tex.offset(), tex.location());
+
+				if (texaddr >= 0xC0000000u)
+				{
+					return;
+				}
+
+				usz size = 0;
+
+				for (const auto& l : get_subresources_layout(tex))
+				{
+					size += l.data.size();
+				}
+
+				note(texaddr, size);
+			};
+
+			for (const auto& tex : method_registers.fragment_textures)
+			{
+				note_texture(tex);
+			}
+
+			for (const auto& tex : method_registers.vertex_textures)
+			{
+				note_texture(tex);
+			}
+
+			const u32 input_mask = method_registers.vertex_attrib_input_mask();
+			u32 min_index = umax, max_index = 0;
+
+			if (method_registers.current_draw_clause.command == draw_command::array)
+			{
+				method_registers.current_draw_clause.begin();
+
+				do
+				{
+					const auto& range = method_registers.current_draw_clause.get_range();
+					min_index = std::min(min_index, range.first);
+					max_index = std::max(max_index, range.first + range.count - 1);
+				}
+				while (method_registers.current_draw_clause.next());
+			}
+			else if (method_registers.current_draw_clause.command == draw_command::indexed)
+			{
+				const auto index_type = method_registers.index_type();
+				const u32 type_size = get_index_type_size(index_type);
+				const u32 base_addr = get_address(method_registers.index_array_address(), method_registers.index_array_location()) & (0 - type_size);
+				const bool restart = method_registers.restart_index_enabled();
+				const u32 restart_index = method_registers.restart_index();
+
+				method_registers.current_draw_clause.begin();
+
+				do
+				{
+					const auto& range = method_registers.current_draw_clause.get_range();
+					const u32 idx_addr = base_addr + range.first * type_size;
+					note(idx_addr, u64{range.count} * type_size);
+
+					for (u32 i = 0; i < range.count; i++)
+					{
+						u32 index = type_size == 2 ? static_cast<u32>(vm::read16(idx_addr + i * 2)) : static_cast<u32>(vm::read32(idx_addr + i * 4));
+
+						if (restart && index == restart_index)
+						{
+							continue;
+						}
+
+						index = get_index_from_base(index, method_registers.vertex_data_base_index());
+						min_index = std::min(min_index, index);
+						max_index = std::max(max_index, index);
+					}
+				}
+				while (method_registers.current_draw_clause.next());
+			}
+
+			if (min_index <= max_index)
+			{
+				for (u8 index = 0; index < limits::vertex_count; ++index)
+				{
+					const auto& info = method_registers.vertex_arrays_info[index];
+
+					if (!(input_mask & (1 << index)) || !info.size())
+					{
+						continue;
+					}
+
+					const u32 base_address = get_vertex_offset_from_base(method_registers.vertex_data_base_offset(), info.offset() & 0x7fffffff);
+					const u32 addr = get_address(base_address, info.offset() >> 31);
+					const u32 stride = info.stride();
+					note(addr + min_index * stride, u64{stride} * (max_index - min_index) + get_vertex_type_size_on_host(info.type(), info.size()));
+				}
+			}
+
+			std::lock_guard lock(g_rb_reads_mutex);
+
+			for (const u32 page : pages)
+			{
+				g_rb_reads[page]++;
+			}
+		}
+
+		std::map<u32, u32> rb_take_read_pages()
+		{
+			std::lock_guard lock(g_rb_reads_mutex);
+			return std::exchange(g_rb_reads, {});
 		}
 
 		void capture_draw_memory(thread* rsx)

@@ -444,6 +444,17 @@ namespace rb::online
 						g_local.emplace(f, std::pair{read_entry(slot_addr(mgr, li, f)), vm::read8(flag_addr(mgr, li, f))});
 						added++;
 
+						// RB_ONLINE_PADTRACE=1: every new local entry with the game pads 0-2 (held at +0x90) at that moment
+						if (static const bool pad_trace = std::getenv("RB_ONLINE_PADTRACE") != nullptr; pad_trace)
+						{
+							u32 seq[2]{};
+							get_seq(seq);
+							rb_online_log.notice("PADTRACE entry %u game frame %u held %x pressed %x pads %x/%x %x/%x %x/%x sim %u", f, seq[0],
+								+vm::read32(slot_addr(mgr, li, f)), +vm::read32(slot_addr(mgr, li, f) + 4),
+								+vm::read32(0x00B06610 + 0x90), +vm::read32(0x00B06610 + 0x94), +vm::read32(0x00B06610 + 0x160 + 0x90), +vm::read32(0x00B06610 + 0x160 + 0x94),
+								+vm::read32(0x00B06610 + 0x2C0 + 0x90), +vm::read32(0x00B06610 + 0x2C0 + 0x94), +vm::read32(mgr + 0x60 + li * 4));
+						}
+
 						if (auto prev = g_local.find(f - 1); prev != g_local.end())
 						{
 							const auto word = [](const entry_t& e, u32 off) { return read_from_ptr<be_t<u32>>(e, off).value(); };
