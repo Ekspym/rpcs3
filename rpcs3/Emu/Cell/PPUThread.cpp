@@ -2729,6 +2729,28 @@ void ppu_thread::cpu_on_stop()
 
 	if (is_stopped())
 	{
+		// tekken-rollback: a thread that is asked to stop but cannot leave its loop (the main thread of a hung game inside
+		// the frame hook) came here millions of times: a 2 GiB log, memory exhausted, a fatal error dialog on closing
+		// (player's report 2026-10-10). After a few calls nothing is logged, and when it lasts 5 s the process ends.
+		thread_local u64 stop_calls = 0;
+		thread_local std::chrono::steady_clock::time_point stop_first{};
+
+		if (++stop_calls > 16)
+		{
+			if (stop_calls == 17)
+			{
+				stop_first = std::chrono::steady_clock::now();
+				ppu_log.error("Thread does not stop: no more messages, the process ends in 5 s if it goes on");
+			}
+			else if (std::chrono::steady_clock::now() - stop_first > std::chrono::seconds(5))
+			{
+				std::quick_exit(0);
+			}
+
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			return;
+		}
+
 		if (last_succ == 0 && last_fail == 0 && exec_bytes == 0)
 		{
 			perf_log.notice("PPU thread perf stats are not available.");

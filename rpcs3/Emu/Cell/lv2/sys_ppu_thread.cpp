@@ -1,5 +1,10 @@
 #include "stdafx.h"
 #include "Emu/Rollback/rb_state.h"
+
+#include <map>
+#include <mutex>
+#include <set>
+#include <vector>
 #include "sys_ppu_thread.h"
 
 #include "Emu/System.h"
@@ -79,9 +84,28 @@ void ppu_thread_exit(ppu_thread& ppu, ppu_opcode_t, be_t<u32>*, struct ppu_intrp
 
 constexpr u32 c_max_ppu_name_size = 28;
 
+// tekken-rollback: ranges left out of the rollback snapshot while a thread lives (see _sys_ppu_thread_create)
+static std::mutex g_rb_thread_ranges_mutex;
+static std::map<u32, std::vector<std::pair<u32, u32>>> g_rb_thread_ranges;
+
 void _sys_ppu_thread_exit(ppu_thread& ppu, u64 errorcode)
 {
 	rb::state_kernel_change("_sys_ppu_thread_exit", 0); // tekken-rollback
+
+	{
+		// tekken-rollback: the thread's object returns to the snapshot (the game frees and reuses the memory)
+		std::lock_guard lock(g_rb_thread_ranges_mutex);
+
+		if (const auto found = g_rb_thread_ranges.find(ppu.id); found != g_rb_thread_ranges.end())
+		{
+			for (const auto& [b, e] : found->second)
+			{
+				rb::state_unexclude_async(b, e, "AT3P stream decoder thread ended");
+			}
+
+			g_rb_thread_ranges.erase(found);
+		}
+	}
 
 	ppu.state += cpu_flag::wait;
 	u64 writer_mask = 0;
@@ -537,6 +561,25 @@ error_code _sys_ppu_thread_create(ppu_thread& ppu, vm::ptr<u64> thread_id, vm::p
 		}
 	}
 
+	// tekken-rollback: the sound stream player objects of Tekken 6 ("CnuSound2Thread:<object address>", arg = the object)
+	// own a thread that runs outside the rollback. Their state (stop flag +0x38, state +0x26c, lwmutexes up to +0x3f0) was
+	// in the snapshot: a rollback put back an older state while the thread went on. At the end of a match the game then
+	// restarted the thread in a loop (it exited at once, 14 times a second) and waited forever for the state to become 0
+	// (FUN_006a7ff4: busy wait) - the hang while the next match loads (players' logs 2026-10-10, three sessions of one
+	// player; the same wait in a log of 2026-10-09). The object stays out of the snapshot from its first thread on.
+	if (ppu_name.starts_with("CnuSound2Thread:") && arg >= 0x10000 && arg < 0xC0000000)
+	{
+		static std::mutex mtx;
+		static std::set<u32> objects;
+		std::lock_guard lock(mtx);
+
+		if (objects.insert(static_cast<u32>(arg)).second)
+		{
+			// The whole object: FUN_006a89dc initialises it up to +0x588 (the first version of this left +0x400..+0x588 in)
+			rb::state_exclude_async(static_cast<u32>(arg), static_cast<u32>(arg) + 0x588, "sound stream thread object (CnuSound2)");
+		}
+	}
+
 	const u32 tid = idm::import<named_thread<ppu_thread>>([&]()
 	{
 		ppu_thread_params p;
@@ -558,6 +601,34 @@ error_code _sys_ppu_thread_create(ppu_thread& ppu, vm::ptr<u64> thread_id, vm::p
 	}
 
 	sys_ppu_thread.warning("_sys_ppu_thread_create(): Thread \"%s\" created (id=0x%x, func=*0x%x, rtoc=0x%x, user-tls=0x%x)", ppu_name, tid, entry.addr, entry.rtoc, tls);
+
+	// tekken-rollback: the AT3P stream decoder object of Tekken 6 (thread "bnusCoreDecoderAT3PThread", FUN_006b448c,
+	// arg = the object D): D+8 the libatrac handle (0x200), +0x208 work memory, +0x210..+0x258 thread id, quit flag,
+	// mutex / cond, stream data cursor (+0x24c source, +0x250 size, +0x254 bytes left to feed), error flag +0x248;
+	// *(D+4) = the output object O (+0x18 decoded frame counter, +0x20.. three PCM buffers and their states). The thread
+	// runs outside the rollback, the object was in the snapshot: a rollback put the handle and the cursor back, the
+	// thread fed the same stream bytes again -> cellAtracDecode "Invalid data found when processing input" in the
+	// middle of a fight (player's log 2026-10-10, 11 rollbacks per second), the stream died, and the stop of the dead
+	// stream at the end of the match waited forever. Out of the snapshot while the thread lives.
+	if (ppu_name == "bnusCoreDecoderAT3PThread" && arg >= 0x10000 && arg < 0xC0000000 && vm::check_addr<8>(static_cast<u32>(arg), vm::page_readable))
+	{
+		const u32 d = static_cast<u32>(arg);
+		const u32 o = vm::read32(d + 4);
+		std::vector<std::pair<u32, u32>> ranges{{d, d + 0x260}};
+
+		if (o >= 0x10000 && o < 0xC0000000 && vm::check_addr<8>(o, vm::page_readable))
+		{
+			ranges.emplace_back(o, o + 0x40);
+		}
+
+		for (const auto& [b, e] : ranges)
+		{
+			rb::state_exclude_async(b, e, "AT3P stream decoder object");
+		}
+
+		std::lock_guard lock(g_rb_thread_ranges_mutex);
+		g_rb_thread_ranges[tid] = std::move(ranges);
+	}
 
 	ppu.check_state();
 	*thread_id = tid;

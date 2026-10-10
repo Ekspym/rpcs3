@@ -117,6 +117,7 @@ namespace rb
 		// mispredicted remote inputs happens there); hooks of the input manager at load time
 		void on_frame(ppu_thread& ppu, u32 root);
 		void end_of_frame(ppu_thread& ppu); // live frame end: early receive of the remote inputs
+		void early_send(ppu_thread& ppu); // live frame, after its tasks: the new local entry is sent in the same frame
 		void sound_learn_begin(); // around sound library calls of live frames: learns the library state (excluded)
 		void sound_learn_end();
 		void install_hooks(std::vector<u32>& applied);

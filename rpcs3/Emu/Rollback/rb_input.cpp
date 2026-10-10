@@ -800,6 +800,12 @@ namespace rb
 			}
 		}
 
+		// The frame's new local input goes to the peer before the frame end wait (see online::early_send)
+		if (!state_resimulating(g_boundary_frame))
+		{
+			online::early_send(ppu);
+		}
+
 		// RB_RESIM_DISCARD (default on, 0 = off): a re-simulated frame's draw requests are discarded (FUN_005c10b4: reset of
 		// the frame allocator, nothing handed to the draw thread) instead of swapped (FUN_005c110c -> FUN_005c4e68), so the
 		// draw thread gets no work and the next boundary does not wait for it (o146: ~3 ms per re-simulated frame)
@@ -827,8 +833,35 @@ namespace rb
 			ppu.gpr[3] = 0x00D2CA98;
 			ppu.gpr[4] = vm::read32(0x00D2CA00 + 0x138);
 			ppu.gpr[5] = param;
+			const auto h0 = std::chrono::steady_clock::now();
 			ppu.fast_call(0x00600698, tekken_toc);
 			result = static_cast<u32>(ppu.gpr[3]);
+
+			// Frame end of the drawn live fight frames (wait for the draw thread, hand-off, vblank wait) = the slack a
+			// rollback in the same frame can use: frames without / with a rollback before them, every 600 frames
+			if (online::fight_active())
+			{
+				static u64 loads_seen = 0, n[2]{}, total[2]{}, under2[2]{}, lag[2]{};
+				const u64 us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - h0).count();
+				const u64 loads = state_load_count();
+				const u32 k = loads != loads_seen;
+				loads_seen = loads;
+
+				if (us < 200000)
+				{
+					n[k]++;
+					total[k] += us;
+					under2[k] += us < 2000;
+					lag[k] += result != 0;
+				}
+
+				if (n[0] + n[1] >= 600)
+				{
+					rb_log.notice("Frame end wait (600 drawn live frames): without rollback %u frames avg %u us (%u under 2 ms, %u late), with rollback %u frames avg %u us (%u under 2 ms, %u late)",
+						n[0], total[0] / std::max<u64>(n[0], 1), under2[0], lag[0], n[1], total[1] / std::max<u64>(n[1], 1), under2[1], lag[1]);
+					n[0] = n[1] = total[0] = total[1] = under2[0] = under2[1] = lag[0] = lag[1] = 0;
+				}
+			}
 		}
 
 		ppu.gpr[1] = old_r1;
@@ -953,11 +986,67 @@ namespace rb
 	u32 g_net_mgr_node = 0, g_net_mgr_serial = 0;
 
 	// The network manager object (tnOnlineBattle_Manager) seen in the task walk, 0 if gone
+	// With the native code (RB_NATIVE) the nested task walks run in the lifted code: after_task_step never sees the
+	// network manager's task, so the early send and the early receive were dead in every native build (no "Early
+	// receive" in any player's log since v1.2; test es1: "no session" in all 1200 calls). The task tree is searched
+	// instead: from the main loop root through +0x10 (next), +0x1c (next sibling), +0x24 (first child).
+	static void find_net_manager()
+	{
+		if (!g_task_root)
+		{
+			return;
+		}
+
+		const auto valid = [](u32 a) { return a >= 0x10000 && a < 0xC0000000u && !(a & 3) && vm::check_addr<4>(a, vm::page_readable) && vm::check_addr<4>(a + 0x34, vm::page_readable); };
+		std::vector<u32> todo{+vm::read32(g_task_root + 0x14)};
+		std::set<u32> seen;
+
+		while (!todo.empty() && seen.size() < 8192)
+		{
+			const u32 node = todo.back();
+			todo.pop_back();
+
+			if (!valid(node) || !seen.insert(node).second)
+			{
+				continue;
+			}
+
+			const u32 obj = node + vm::read32(node + 0x34);
+
+			if (vm::check_addr<4>(obj, vm::page_readable) && vm::check_addr<4>(obj + 0x5c, vm::page_readable) && vm::read32(obj) == 0x0091E138u)
+			{
+				g_net_mgr_node = node;
+				g_net_mgr_serial = vm::read32(node + 0xc);
+
+				if (static u32 logged = 0; logged++ < 5)
+				{
+					rb_log.success("Network manager task found in the task tree: node 0x%08x, object 0x%08x (%u nodes searched)", node, obj, seen.size());
+				}
+
+				return;
+			}
+
+			for (const u32 off : {0x10u, 0x1cu, 0x24u})
+			{
+				todo.push_back(vm::read32(node + off));
+			}
+		}
+	}
+
 	u32 net_manager_object()
 	{
-		if (!g_net_mgr_node || vm::read32(g_net_mgr_node + 0xc) != g_net_mgr_serial)
+		if (!g_net_mgr_node || !vm::check_addr<4>(g_net_mgr_node + 0x34, vm::page_readable) || vm::read32(g_net_mgr_node + 0xc) != g_net_mgr_serial)
 		{
-			return 0;
+			// At most twice a second
+			if (static u32 calls = 0; calls++ % 30 == 0)
+			{
+				find_net_manager();
+			}
+
+			if (!g_net_mgr_node || !vm::check_addr<4>(g_net_mgr_node + 0x34, vm::page_readable) || vm::read32(g_net_mgr_node + 0xc) != g_net_mgr_serial)
+			{
+				return 0;
+			}
 		}
 
 		const u32 mgr = g_net_mgr_node + vm::read32(g_net_mgr_node + 0x34);

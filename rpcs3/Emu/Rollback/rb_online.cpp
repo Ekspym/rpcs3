@@ -3715,8 +3715,22 @@ namespace rb::online
 		static const bool on = !std::getenv("RB_ONLINE_EARLY_RECV") || *std::getenv("RB_ONLINE_EARLY_RECV") != '0';
 		const u32 mgr = manager();
 
+		// Diagnostics (2026-10-10: no "Early receive" in any run with the native code): why the call ends, every 1200 calls
+		static u64 calls = 0, r_cond = 0, r_net = 0, r_recv = 0, r_ok = 0, r_mismatch = 0;
+		const auto report = [&]()
+		{
+			if (++calls % 1200 == 0)
+			{
+				rb_online_log.notice("End of frame receive (1200 calls): not in a fight / off %u, no session %u, receiver not ready %u, received %u, mispredictions found %u",
+					r_cond, r_net, r_recv, r_ok, r_mismatch);
+				r_cond = r_net = r_recv = r_ok = r_mismatch = 0;
+			}
+		};
+
 		if (!on || !config().predict || !mgr || !in_fight() || !use_stress_ring() || !state_stress_ready())
 		{
+			r_cond++;
+			report();
 			return;
 		}
 
@@ -3724,10 +3738,15 @@ namespace rb::online
 
 		if (!net || vm::read32(net + 0x5c) == 0)
 		{
+			r_net++;
+			report();
 			return;
 		}
 
 		const bool ok = run_receiver(ppu);
+		(ok ? r_ok : r_recv)++;
+		r_mismatch += ok && g_mismatch_frame != umax;
+		report();
 
 		if (ok && g_mismatch_frame != umax)
 		{
@@ -3739,6 +3758,90 @@ namespace rb::online
 			{
 				rb_online_log.success("Early receive: misprediction found at the end of the frame, rollback at the next boundary");
 			}
+		}
+	}
+
+	// RB_ONLINE_EARLY_SEND (default on, 0 = off): the game's sender FUN_00422ce0(net) (window of the newest 6 local
+	// entries) runs in its own task before the controller task adds the frame's local entry, so every local input left
+	// one frame after it was created. Test lag0 (LagMs 0, delay 1, 2026-10-10): one side still predicted in 92-96 % of
+	// its live frames and rolled back 447 times in two rounds - with no network delay at all; at a real ping every
+	// rollback was one frame deeper than the ping needs (players' logs at 62 ms: 12 rollbacks/s, 3.6 frames each).
+	// The sender runs once more at the end of a live frame's tasks, before the frame end wait (vblank): the entry
+	// goes out in the frame that created it. The window is sent again by the regular task (the same entries: a
+	// duplicate for the peer). Not in a re-simulated frame.
+	void early_send(ppu_thread& ppu)
+	{
+		static const bool on = !std::getenv("RB_ONLINE_EARLY_SEND") || *std::getenv("RB_ONLINE_EARLY_SEND") != '0';
+		const u32 mgr = manager();
+
+		if (static u64 calls = 0; calls++ % 3600 == 0)
+		{
+			rb_online_log.notice("Early send: call %u (on %d, predict %d, manager 0x%x, in fight %d, re-simulating %d)", calls, on, config().predict, mgr,
+				in_fight(), is_resimulating());
+		}
+
+		if (!on || !config().predict || !mgr || !in_fight() || is_resimulating())
+		{
+			return;
+		}
+
+		const u32 net = net_manager_object();
+
+		if (!net || vm::read32(net + 0x5c) == 0)
+		{
+			return;
+		}
+
+		// Only when the newest local entry was added in this frame (available moved since the previous call)
+		static u32 last_available = umax;
+		const u32 li = 2 - remote_player(mgr);
+		const u32 available = vm::read32(mgr + 0x58 + li * 4);
+
+		if (available == last_available)
+		{
+			return;
+		}
+
+		last_available = available;
+
+		const u32 old_r1 = static_cast<u32>(ppu.gpr[1]);
+		ppu.gpr[1] = (old_r1 - 0x300) & ~0xfu; // FUN_00422ce0 keeps a 0x250 byte message on its stack
+		vm::write32(static_cast<u32>(ppu.gpr[1]), old_r1);
+		constexpr u64 toc = 0x0096A8B0;
+
+		// The session must be connected (the same checks as the receiver and the sender after the input task)
+		ppu.fast_call(0x00425f04, toc);
+		const u32 session = static_cast<u32>(ppu.gpr[3]);
+		bool ok = false;
+
+		if (session)
+		{
+			ppu.gpr[3] = session;
+			ppu.fast_call(0x004240c0, toc);
+
+			if (static_cast<u32>(ppu.gpr[3]))
+			{
+				ppu.gpr[3] = session;
+				ppu.fast_call(0x00424148, toc);
+				const u32 state = static_cast<u32>(ppu.gpr[3]);
+				ok = state && vm::read32(state + 0xc) == 1;
+			}
+		}
+
+		if (!ok)
+		{
+			ppu.gpr[1] = old_r1;
+			return;
+		}
+
+		ppu.gpr[3] = net;
+		ppu.fast_call(0x00422ce0, toc);
+		ppu.gpr[1] = old_r1;
+
+		if (static u64 n = 0; n++ % 3600 == 0)
+		{
+			rb_online_log.notice("Early send: %u local entries sent in the frame that created them (available %u, sent %u)", n,
+				available, +vm::read32(mgr + 0x68 + li * 4));
 		}
 	}
 
