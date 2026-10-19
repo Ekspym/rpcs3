@@ -110,10 +110,13 @@ namespace rb::t5dr
 		seed_lf(rng_lf2_index, rng_lf2_table, 1893);
 	}
 
-	// Small fingerprint of the generator states (diagnostics: equal in the record and the replay log)
+	// Small fingerprint of the generator states (diagnostics: equal in the record and the replay log).
+	// rand() is left out: in the fight it is only drawn by the particle effects (FUN_00124e08 .. FUN_00132678, 9 draws per
+	// particle), whose particle count follows the real frame time (FUN_0025d240), so it differs between runs and between
+	// PCs without changing the fight (RB_T5_RNGLOG runs 2026-10-19: the only differing call sites were 0x001326f4..0x00132bc0).
 	inline u32 rng_fingerprint()
 	{
-		u32 h = vm::read32(rng_rand_state) * 0x9e3779b1u;
+		u32 h = 0x9e3779b1u;
 
 		for (u32 a = rng_lf1_index; a < rng_lf2_table + rng_words * 4; a += 4)
 		{
