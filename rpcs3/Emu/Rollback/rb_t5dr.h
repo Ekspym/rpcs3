@@ -49,6 +49,13 @@ namespace rb::t5dr
 	constexpr u32 task_walk = 0x0025fca4;      // patched: branch to the rollback frame step (HLE)
 	constexpr u32 task_walk_body = 0x0025fba0; // FUN_0025fba0(root, first, end): the list walk itself
 	constexpr u32 task_root_ptr = 0x00479054;  // TOC slot holding the root pointer (diagnostics)
+	// Frame end, called by the main loop before the task walk for the frame drawn in the previous iteration:
+	// FUN_00323ce8(), FUN_00355b70() (GCM flip and the wait for flip status / vblank), FUN_00325060(*(TOC-3952))
+	constexpr u32 frame_end = 0x00323d24;
+	constexpr u32 frame_end_pre = 0x00323ce8;
+	constexpr u32 frame_end_flip = 0x00355b70;
+	constexpr u32 frame_end_post = 0x00325060;
+	constexpr s32 toc_frame_end_post_arg = -3952;
 	constexpr u32 key_latest = 0x00122360;     // patched: FUN_00122360(player) -> u16 game buttons of the frame (HLE)
 	constexpr u32 key_special = 0x0004174c;    // called first by FUN_00122360 in game mode 4 / sub mode 17
 	constexpr s32 toc_key_mode = -19012;       // TOC slot -> game mode struct (+0 mode, +16 sub mode)
@@ -76,6 +83,11 @@ namespace rb::t5dr
 		{0x001223ac, 0x8122b594}, // lwz r9, -19052(r2)
 		{0x001223cc, 0x8122b5a0}, // lwz r9, -19040(r2)
 		{0x00013140, 0x4810f221}, // bl FUN_00122360               (its only call site)
+		{0x00323d24, 0xf821ff91}, // stdu r1, -112(r1)            (frame end FUN_00323d24)
+		{0x00323d30, 0x4bffffb9}, // bl FUN_00323ce8
+		{0x00323d34, 0x48031e3d}, // bl FUN_00355b70               (flip + flip status / vblank wait)
+		{0x00323d3c, 0x8062f090}, // lwz r3, -3952(r2)
+		{0x00323d40, 0x48001321}, // bl FUN_00325060
 	};
 
 	// Random number generators of the game (library code at 0x00370fd8..0x00371128). All are seeded with constants

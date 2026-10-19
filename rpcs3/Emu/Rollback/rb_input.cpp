@@ -42,6 +42,7 @@ extern bool ppu_form_branch_to_code(u32 entry, u32 target);
 namespace rb
 {
 	bool g_t5dr = false; // Tekken 5 DR (rb_t5dr.h): frame hook installed on its task walk
+	bool g_t5_last_walk_resim = false; // T5DR: the previous main loop iteration's task walk was a re-simulated frame
 
 	namespace
 	{
@@ -2278,6 +2279,9 @@ namespace rb
 			run_task_walk(ppu, root);
 		}
 
+		// The frame end at the start of the next iteration flips this frame only if it was a live one
+		g_t5_last_walk_resim = g_t5dr && g_state.synced && state_resimulating(g_boundary_frame);
+
 		if (slow_diag)
 		{
 			const auto now = std::chrono::steady_clock::now();
@@ -2902,6 +2906,40 @@ namespace rb
 
 	const u32 s_t5_keys_index = REG_HIDDEN_FUNC(rb_t5_keys);
 
+	u64 g_t5_flips_skipped = 0;
+
+	void t5_call(ppu_thread& ppu, u32 addr)
+	{
+		const u64 old_r1 = ppu.gpr[1];
+		ppu.gpr[1] = (old_r1 - 0x100) & ~0xfull;
+		vm::write32(static_cast<u32>(ppu.gpr[1]), static_cast<u32>(old_r1));
+		ppu.fast_call(addr, t5dr::toc);
+		ppu.gpr[1] = old_r1;
+	}
+
+	// Replacement of the frame end FUN_00323d24 (RB_T5_FAST_RESIM, default on): a re-simulated frame is not flipped and
+	// does not wait for the flip / vblank, so a rollback's re-simulated frames run at CPU speed (stress test 2026-10-19:
+	// 7 re-simulated frames took ~160 ms, each one waiting for a vblank). Its draw data is simply replaced by the next
+	// live frame's. The frame bookkeeping before and after the flip still runs.
+	void rb_t5_frame_end(ppu_thread& ppu)
+	{
+		t5_call(ppu, t5dr::frame_end_pre);
+
+		if (g_t5_last_walk_resim)
+		{
+			g_t5_flips_skipped++;
+		}
+		else
+		{
+			t5_call(ppu, t5dr::frame_end_flip);
+		}
+
+		ppu.gpr[3] = vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_frame_end_post_arg));
+		t5_call(ppu, t5dr::frame_end_post);
+	}
+
+	const u32 s_t5_frame_end_index = REG_HIDDEN_FUNC(rb_t5_frame_end);
+
 	// RB_T5_RNGLOG=1 (diagnostics): the game's random generators are replaced by exact C++ copies that count their callers
 	// (call site = LR); every 300 fight frames the log lists the callers and how often they drew. Two runs that should be
 	// identical (clean replay vs. rewind / stress test) show which caller draws differently first.
@@ -2997,6 +3035,17 @@ namespace rb
 			{
 				applied.push_back(t5dr::key_latest);
 				rb_log.success("Tekken 5 DR input hook: 0x%08x (newest key sample per frame) -> HLE 0x%08x", t5dr::key_latest, keys_target);
+			}
+
+			if (get_env("RB_T5_FAST_RESIM") != "0")
+			{
+				const u32 end_target = g_fxo->get<ppu_function_manager>().func_addr(s_t5_frame_end_index, true);
+
+				if (end_target && ppu_form_branch_to_code(t5dr::frame_end, end_target))
+				{
+					applied.push_back(t5dr::frame_end);
+					rb_log.success("Tekken 5 DR frame end: 0x%08x -> HLE 0x%08x (re-simulated frames are not flipped)", t5dr::frame_end, end_target);
+				}
 			}
 
 			if (get_env("RB_T5_RNGLOG") == "1")

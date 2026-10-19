@@ -904,7 +904,8 @@ namespace rb
 		void wait_for_flip()
 		{
 			// RB_SNAP_WAIT_FLIP=0 disables the wait (not needed when no render data is restored)
-			static const bool enabled = []() { const char* v = std::getenv("RB_SNAP_WAIT_FLIP"); return !v || *v != '0'; }();
+			// T5DR: off by default (render state is not restored, and re-simulated frames are not flipped at all)
+			static const bool enabled = []() { const char* v = std::getenv("RB_SNAP_WAIT_FLIP"); return v && *v ? *v != '0' : !t5dr_active(); }();
 			const auto ppu = get_current_cpu_thread<ppu_thread>();
 
 			if (!enabled || !ppu)
