@@ -96,7 +96,14 @@ for the environment variables. Your ladder program starts RPCS3 with them:
    `RB_SNAP_RANGES=~0x00450000-0x004A0000,~0x10050000-0x10770000,~0x20000000-0x40000000`, `RB_SNAP_TRACK=1`,
    `RB_SNAP_SAVE_AT=+60`, `RB_SNAP_RESTORE_AT=+600`. The restore test must continue the fight exactly as
    the replay (same hashes). Then the stress test (`RB_SNAP_STRESS_EVERY`) with prediction (`RB_SNAP_PREDICT=1`).
-5. **Two instances on one PC.** `RB_NET=1`, player 1 on 7000→7001, player 2 on 7001→7000, both with
+   *Stress test done 2026-10-19 (build b1b6383): `RB_SNAP_TRACK=1 RB_SNAP_CONT_CAL=1 RB_SNAP_STRESS_EVERY=30 RB_SNAP_DEPTH=7`
+   with calibrated ranges, 250+ rollbacks without a crash, saves/loads ~0.6 ms, ~33 ms per 7-frame rollback (re-simulated
+   frames get an immediate vblank, `g_rb_vblank_kick`). Open: the sound thread (bnusCoreUpdateThread) crashed late in two
+   long stress runs (after the recording ended); `RB_T5_FAST_RESIM=1` (no flip for re-simulated frames) crashes.*
+5. **Two instances on one PC.** NEXT STEP (not run yet). Copy `bin` to `bin2`; both: replay settings of the stress test
+   without `RB_SNAP_STRESS_*`, plus `RB_NET=1 RB_NET_INPUT=record RB_NET_START=+620 RB_NET_DELAY=2`; player 1
+   `RB_NET_PLAYER=1 RB_NET_LOCAL_PORT=7000 RB_NET_REMOTE=127.0.0.1:7001`, player 2 the other way round. GGPO re-simulates
+   inside one main loop iteration (rb_net.cpp cb_advance_frame), without flips. `RB_NET=1`, player 1 on 7000→7001, player 2 on 7001→7000, both with
    `RB_NET_INPUT=record` and the same recording, then `ggpo.network.delay` to simulate latency.
 6. **Menus.** Both instances must reach the fight in the same state (same characters, stage, settings).
    Easiest first version: the ladder sends both clients the match settings and the session starts at the
