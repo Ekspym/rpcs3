@@ -677,6 +677,7 @@ namespace rb
 	bool g_frame_hook_installed = false;
 	void t5dr_task_diag(u32 root);
 	void t5dr_frame_checks();
+	std::string rng_calls_text();
 
 	void rb_frame_step(ppu_thread& ppu, u32 root);
 	const u32 s_frame_step_index = REG_HIDDEN_FUNC(rb_frame_step);
@@ -2486,6 +2487,11 @@ namespace rb
 			{
 				last = g_state.seq[0];
 				rb_log.notice("T5DR fight frame %u: rng 0x%08x", g_state.seq[0] - g_sync_frame, t5dr::rng_fingerprint());
+
+				if (static const bool rng_log = get_env("RB_T5_RNGLOG") == "1"; rng_log)
+				{
+					rb_log.notice("T5DR random draws before fight frame %u (r=rand A=add M=mul, call site:count):%s", g_state.seq[0] - g_sync_frame, rng_calls_text());
+				}
 			}
 		}
 
@@ -2896,6 +2902,74 @@ namespace rb
 
 	const u32 s_t5_keys_index = REG_HIDDEN_FUNC(rb_t5_keys);
 
+	// RB_T5_RNGLOG=1 (diagnostics): the game's random generators are replaced by exact C++ copies that count their callers
+	// (call site = LR); every 300 fight frames the log lists the callers and how often they drew. Two runs that should be
+	// identical (clean replay vs. rewind / stress test) show which caller draws differently first.
+	std::map<u32, u32> g_rng_calls;
+	std::mutex g_rng_mutex;
+
+	void rng_note(u32 lr, u32 kind)
+	{
+		std::lock_guard lock(g_rng_mutex);
+		g_rng_calls[(kind << 28) | (lr & 0x0fffffff)]++;
+	}
+
+	std::string rng_calls_text()
+	{
+		std::lock_guard lock(g_rng_mutex);
+		std::string out;
+
+		for (const auto& [key, n] : g_rng_calls)
+		{
+			fmt::append(out, " %c%x:%u", "rAM"[std::min<u32>(key >> 28, 2)], key & 0x0fffffff, n);
+		}
+
+		g_rng_calls.clear();
+		return out;
+	}
+
+	u32 rb_t5_rand(ppu_thread& ppu)
+	{
+		rng_note(static_cast<u32>(ppu.lr), 0);
+		const u32 x = vm::read32(t5dr::rng_rand_state) * 0x6c078965u + 12345u;
+		vm::write32(t5dr::rng_rand_state, x);
+		return x & 0x7fffffffu;
+	}
+
+	u32 t5_lf_step(u32 index_addr, u32 table, bool multiply)
+	{
+		const u32 idx = vm::read32(index_addr);
+		const u32 a = vm::read32(table + (((idx - 28) << 2) & 0x7c));
+		const u32 b = vm::read32(table + (((idx - 3) << 2) & 0x7c));
+		const u32 v = multiply ? a * b : a + b;
+		vm::write32(index_addr, (idx + 1) & 31);
+		vm::write32(table + (idx << 2), v);
+		return v & 0x7fffffffu;
+	}
+
+	s32 t5_lf_range(u32 r, s32 lo, s32 hi)
+	{
+		const s32 n = hi - lo + 1;
+		const s32 q = n ? static_cast<s32>(r) / n : 0;
+		return static_cast<s32>(r) - q * n + lo;
+	}
+
+	s32 rb_t5_random_add(ppu_thread& ppu, s32 lo, s32 hi)
+	{
+		rng_note(static_cast<u32>(ppu.lr), 1);
+		return t5_lf_range(t5_lf_step(t5dr::rng_lf1_index, t5dr::rng_lf1_table, false), lo, hi);
+	}
+
+	s32 rb_t5_random_mul(ppu_thread& ppu, s32 lo, s32 hi)
+	{
+		rng_note(static_cast<u32>(ppu.lr), 2);
+		return t5_lf_range(t5_lf_step(t5dr::rng_lf2_index, t5dr::rng_lf2_table, true), lo, hi);
+	}
+
+	const u32 s_t5_rand_index = REG_HIDDEN_FUNC(rb_t5_rand);
+	const u32 s_t5_random_add_index = REG_HIDDEN_FUNC(rb_t5_random_add);
+	const u32 s_t5_random_mul_index = REG_HIDDEN_FUNC(rb_t5_random_mul);
+
 	void install_t5dr_hooks(std::vector<u32>& applied)
 	{
 		for (const t5dr::code_word& w : t5dr::code_signature)
@@ -2923,6 +2997,27 @@ namespace rb
 			{
 				applied.push_back(t5dr::key_latest);
 				rb_log.success("Tekken 5 DR input hook: 0x%08x (newest key sample per frame) -> HLE 0x%08x", t5dr::key_latest, keys_target);
+			}
+
+			if (get_env("RB_T5_RNGLOG") == "1")
+			{
+				const std::pair<u32, u32> rng_hooks[] =
+				{
+					{0x00370fe4, s_t5_rand_index},       // rand()
+					{0x00163d6c, s_t5_random_add_index}, // random(lo, hi), additive generator
+					{0x00163e04, s_t5_random_mul_index}, // random(lo, hi), multiplicative generator
+				};
+
+				for (const auto& [addr, index] : rng_hooks)
+				{
+					const u32 hle = g_fxo->get<ppu_function_manager>().func_addr(index, true);
+
+					if (hle && ppu_form_branch_to_code(addr, hle))
+					{
+						applied.push_back(addr);
+						rb_log.success("Tekken 5 DR random generator 0x%08x -> HLE 0x%08x (caller log)", addr, hle);
+					}
+				}
 			}
 			else
 			{
