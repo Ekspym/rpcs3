@@ -57,6 +57,7 @@ for the environment variables. Your ladder program starts RPCS3 with them:
 | `RB_NET_DELAY` | input delay frames (GGPO fork: max 3 predicted frames) |
 | `RB_NET_START=+N` | session starts N frames after the sync point |
 | `RB_T5_SYNC_TASK=<class>` | sync point = first frame with a task of that class (new, see below) |
+| `RB_REPLAY_FROM_SYNC=1` | replay: live controller until the sync point, the recording after it |
 | `RB_T5_BUTTONS=L2=1+4,R2=3+4,...` | button mapping of the local controller (rb_t5dr.h), set by the launcher |
 | `RB_SNAP_RANGES`, `RB_SNAP_SAVE_AT`, `RB_SNAP_RESTORE_AT`, `RB_SNAP_TRACK` | snapshot setup (rb_state.h) |
 
@@ -70,7 +71,11 @@ for the environment variables. Your ladder program starts RPCS3 with them:
    loadable the whole time.* Original step: `RB_T5_TASKLOG=1`, play one Versus match. The log prints the task list (RTTI class
    names) every time it changes. Note the class that appears when the round starts and leaves after the match.
    Put it in `RB_T5_SYNC_TASK` (substring match).
-3. **Determinism.** Same match twice with `RB_MODE=record` then `RB_MODE=replay` and `RB_HASH=<file>`
+3. **Determinism.** Same match twice with `RB_MODE=record` then `RB_MODE=replay` and `RB_HASH=<file>`.
+   The menus do not take the same number of frames each run (pads are read on the game's `keyread` thread), so use
+   `RB_T5_SYNC_TASK=tcb_swg_game_t` in both runs and `RB_REPLAY_FROM_SYNC=1` in the replay: drive the menus by hand to
+   the same characters and stage, the recording takes over when the round starts. Bare file names (`RB_HASH=hash.txt`)
+   are written to the RPCS3 config folder (next to `rpcs3.exe` on Windows).
    (`rb_input.h`, `rb_checksum.h`). The per-frame hashes from the sync point on must be identical across runs
    *and across both PCs*. If not, find the source with `RB_WATCH` / `RB_DUMP_FRAMES`. Usual causes:
    `sys_time_get_system_time` (4 callers: `0x0001047c`, `0x0034bad8`, `0x0034bb88`, `0x003c4f7c`; use

@@ -77,6 +77,7 @@ namespace rb
 			u32 sync_addr = 0;
 			u32 sync_frame = 0; // RB_SYNC_FRAME: sync point at this port 0 read (recordings without the LCG seed)
 			bool synced = false;
+			bool replay_from_sync = false; // RB_REPLAY_FROM_SYNC=1: live input until the sync point, the recording after it
 			s64 recorded_sync_seq[max_ports]{-1, -1};
 		};
 
@@ -153,10 +154,11 @@ namespace rb
 		void init()
 		{
 			const std::string mode = get_env("RB_MODE");
-			std::string path = get_env("RB_FILE");
-			const std::string stats_path = get_env("RB_STATS");
+			std::string path = out_path(get_env("RB_FILE"));
+			const std::string stats_path = out_path(get_env("RB_STATS"));
 			g_state.sync_addr = static_cast<u32>(std::strtoul(get_env("RB_SYNC_ADDR").c_str(), nullptr, 16));
 			g_state.sync_frame = static_cast<u32>(std::strtoul(get_env("RB_SYNC_FRAME").c_str(), nullptr, 10));
+			g_state.replay_from_sync = get_env("RB_REPLAY_FROM_SYNC") == "1";
 
 			// RB_NET_DUMP=1: every UDP packet of the game in the log (sys_net_dump trace) plus a marker per main loop frame
 			if (get_env("RB_NET_DUMP") == "1")
@@ -468,6 +470,8 @@ namespace rb
 		}
 	}
 
+	std::atomic<bool> g_t5dr_sync_pending{false}; // set by the task walk (main thread) when the sync task appears
+
 	void on_pad_get_data_impl(u32 port_no, CellPadData* data)
 	{
 		ensure_init();
@@ -484,7 +488,7 @@ namespace rb
 			g_port0_reads++;
 		}
 
-		if (port_no == 0 && !g_state.synced && ((g_state.sync_frame && g_state.seq[0] >= g_state.sync_frame) ||
+		if (port_no == 0 && !g_state.synced && (g_t5dr_sync_pending.load() || (g_state.sync_frame && g_state.seq[0] >= g_state.sync_frame) ||
 			(g_state.sync_addr && vm::check_addr<4>(g_state.sync_addr, vm::page_readable) && *vm::get_super_ptr<u32>(g_state.sync_addr) != 0u)))
 		{
 			check_sync_point();
@@ -591,6 +595,13 @@ namespace rb
 		}
 		case mode_t::replay:
 		{
+			// Menus and loading do not take the same number of frames every run (Tekken 5 DR): with RB_REPLAY_FROM_SYNC the
+			// player navigates the menus to the same fight and the recording takes over at the sync point (fight start)
+			if (g_state.replay_from_sync && !g_state.synced)
+			{
+				break;
+			}
+
 			const auto& records = g_state.replay[port_no];
 
 			if (seq >= records.size())
@@ -2372,6 +2383,18 @@ namespace rb
 	}
 
 	// One frame of the main loop: the task walk of FUN_00100250 (see rb_frame_step)
+	// Output files given as a bare name (RB_HASH=hash.txt) were opened relative to the working directory, which can be
+	// a folder RPCS3 cannot write to ("Checksum file 'hash_replay.txt' cannot be created", T5DR test 2026-10-19)
+	std::string out_path(const std::string& path)
+	{
+		if (path.empty() || path[0] == '/' || path[0] == '\\' || path.find(':') != std::string::npos)
+		{
+			return path;
+		}
+
+		return fs::get_config_dir() + path;
+	}
+
 	bool t5dr_active()
 	{
 		return g_t5dr;
@@ -2462,9 +2485,11 @@ namespace rb
 				if (t5dr_class_name(vt).find(sync_task) != umax)
 				{
 					// Same as an RB_SYNC_ADDR sync point: recorded as a marker in record mode, realigns the replay
-					rb_log.success("T5DR sync point: task %s (0x%08x) appeared", t5dr_class_name(vt), vt);
+					// The pads are read on the game's "keyread" thread, not on this one: the sync point is taken by the next
+					// port 0 read there, so the read counters are not changed under that thread's feet
+					rb_log.success("T5DR sync point: task %s (0x%08x) appeared at game frame %u", t5dr_class_name(vt), vt, g_state.seq[0]);
 					ensure_init();
-					check_sync_point();
+					g_t5dr_sync_pending = true;
 					break;
 				}
 			}

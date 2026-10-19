@@ -129,7 +129,7 @@ namespace rb
 				g_dump_frames.push_back(std::strtoull(item.c_str(), nullptr, 10));
 			}
 
-			g_dump_prefix = prefix;
+			g_dump_prefix = out_path(prefix);
 			rb_log.success("Dumping memory at %u game frames to '%s_<frame>.bin'", g_dump_frames.size(), g_dump_prefix);
 		}
 
@@ -191,12 +191,14 @@ namespace rb
 		void init_watch()
 		{
 			const char* list = std::getenv("RB_WATCH");
-			const char* path = std::getenv("RB_WATCH_OUT");
+			const char* path_env = std::getenv("RB_WATCH_OUT");
 
-			if (!list || !*list || !path || !*path)
+			if (!list || !*list || !path_env || !*path_env)
 			{
 				return;
 			}
+
+			const std::string path = out_path(path_env);
 
 			for (const std::string& item : fmt::split(list, {","}))
 			{
@@ -280,12 +282,14 @@ namespace rb
 			init_watch();
 			init_dump();
 
-			const char* path = std::getenv("RB_HASH");
+			const char* path_env = std::getenv("RB_HASH");
 
-			if (!path || !*path)
+			if (!path_env || !*path_env)
 			{
 				return;
 			}
+
+			const std::string path = out_path(path_env);
 
 			g_every = std::max<u64>(env_u64("RB_HASH_EVERY", 60), 1);
 			g_from = env_u64("RB_HASH_FROM", 0);
@@ -378,7 +382,7 @@ namespace rb
 	{
 		if (g_dump_prefix.empty())
 		{
-			g_dump_prefix = prefix;
+			g_dump_prefix = out_path(prefix);
 		}
 
 		dump_memory(game_frame);
