@@ -149,6 +149,40 @@ namespace rb::t5dr
 		return h;
 	}
 
+	// Fight state (memory dumps of a replayed fight 2026-10-19, same addresses in two runs): per player a struct 0x8d0
+	// bytes apart, health u16 (145 = full) and its percentage u16 at +0xc, position x/y/z floats at +0x74; the round frame
+	// counter (float, counts from the round start). Desync check of the netplay (rb_net.cpp): both sides compare this.
+	constexpr u32 fight_health[2] = {0x10090efc, 0x100917cc};
+	constexpr u32 fight_pos_offset = 0x74;
+	constexpr u32 fight_round_frame = 0x1009aa14;
+
+	inline u32 fight_fingerprint()
+	{
+		u32 h = rng_fingerprint();
+		const auto mix = [&](u32 v) { h = (h ^ v) * 0x01000193u; };
+
+		for (const u32 base : fight_health)
+		{
+			if (!vm::check_addr<4>(base) || !vm::check_addr<12>(base + fight_pos_offset))
+			{
+				return 0;
+			}
+
+			mix(vm::read16(base));
+			mix(vm::read32(base + fight_pos_offset + 0));
+			mix(vm::read32(base + fight_pos_offset + 4));
+			mix(vm::read32(base + fight_pos_offset + 8));
+		}
+
+		mix(vm::read32(fight_round_frame));
+		return h | 1; // 0 = no fingerprint
+	}
+
+	inline u32 fight_health_of(int player)
+	{
+		return vm::check_addr<2>(fight_health[player & 1]) ? +vm::read16(fight_health[player & 1]) : 0;
+	}
+
 	// GPU frame fence of the render manager (static object *(TOC+1912) = 0x106dca00, FUN_0035374c / FUN_003538b0):
 	// +652 frame counter, +656/+660 addresses of RSX labels 252/253. Every frame the counter goes to a label and into an
 	// RSX semaphore command; rolled back, the RSX waits for an old value (third rewind test 2026-10-19:
