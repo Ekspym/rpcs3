@@ -123,6 +123,13 @@ namespace rb::t5dr
 		return h;
 	}
 
+	// GPU frame fence of the render manager (static object *(TOC+1912) = 0x106dca00, FUN_0035374c / FUN_003538b0):
+	// +652 frame counter, +656/+660 addresses of RSX labels 252/253. Every frame the counter goes to a label and into an
+	// RSX semaphore command; rolled back, the RSX waits for an old value (third rewind test 2026-10-19:
+	// semaphore_acquire time-out on 0x60300FD0 right after the restore). Left out of the snapshot.
+	constexpr u32 render_fence = 0x106dca00 + 640;
+	constexpr u32 render_fence_end = 0x106dca00 + 664;
+
 	inline bool is_title(std::string_view id)
 	{
 		return id == title_id;

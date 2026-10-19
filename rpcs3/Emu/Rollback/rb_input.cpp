@@ -227,6 +227,11 @@ namespace rb
 				t5dr::reseed_rngs();
 			}
 
+			if (g_t5dr)
+			{
+				state_exclude(t5dr::render_fence, t5dr::render_fence_end, "T5DR GPU frame fence");
+			}
+
 			if (g_state.mode == mode_t::record)
 			{
 				for (u32 p = 0; p < max_ports; p++)
