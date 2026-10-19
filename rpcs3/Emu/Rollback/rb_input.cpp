@@ -2289,6 +2289,13 @@ namespace rb
 			static const bool unlimited = get_env("RB_T5_RESIM_UNLIMITED") != "0";
 			static bool lifted = false;
 
+			// ... and does not wait for the next vblank either: one extra vblank is posted right away (RSXThread.cpp)
+			if (unlimited && g_t5_last_walk_resim)
+			{
+				g_rb_vblank_fast_poll = true;
+				g_rb_vblank_kick = 1;
+			}
+
 			if (unlimited && g_t5_last_walk_resim && !g_disable_frame_limit)
 			{
 				g_disable_frame_limit = true;
