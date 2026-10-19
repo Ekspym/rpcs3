@@ -87,6 +87,7 @@ namespace rb
 	// Main loop frame pieces, used by the netplay module for re-simulated frames
 	void run_task_walk(ppu_thread& ppu, u32 root); // one frame of the game (task walk of the main loop)
 	bool t5dr_active(); // Tekken 5 DR (rb_t5dr.h): its frame hook is installed
+	void t5dr_between_walks(ppu_thread& ppu); // Tekken 5 DR: the main loop code between two task walks, with the flip
 	std::string out_path(const std::string& path); // relative output files go to the RPCS3 config folder
 	// RB_TASK_CHECK=<game frame>: from that frame on, checks the global task list of the main loop root (diagnostics; called
 	// by rb_state right after a snapshot load and right before a save). `when` = "after load" / "after frame".

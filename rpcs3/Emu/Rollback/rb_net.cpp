@@ -103,6 +103,7 @@ namespace rb::net
 		bool g_inputs_valid = false;
 
 		u64 g_frames = 0, g_resim_frames = 0, g_loads = 0, g_wait_ms = 0;
+		bool g_advance_pending = false; // T5DR: ggpo_advance_frame of the last live frame, done at the next frame boundary
 
 		void pack(const CellPadData& pad, u8* out)
 		{
@@ -173,13 +174,21 @@ namespace rb::net
 			delete[] static_cast<u64*>(buffer);
 		}
 
-		// Re-simulation of one frame inside a rollback (called from ggpo_idle)
+		// Re-simulation of one frame inside a rollback (called from ggpo_idle). Tekken 5 DR: a GGPO frame is a whole main
+		// loop iteration from one task walk to the next (snapshots are taken right before the task walk), so the
+		// re-simulated frame also runs the loop code after its walk, flip included (t5dr_between_walks).
 		bool __cdecl cb_advance_frame(int)
 		{
 			sync_inputs();
 			state_net_set_resim(true);
 			begin_frame();
 			run_task_walk(*g_ppu, g_root);
+
+			if (t5dr_active())
+			{
+				t5dr_between_walks(*g_ppu);
+			}
+
 			state_net_set_resim(false);
 			ggpo_advance_frame(g_session);
 			g_resim_frames++;
@@ -339,6 +348,15 @@ namespace rb::net
 			return false;
 		}
 
+		// Tekken 5 DR: the previous live frame ends here, at the boundary after the main loop ran its code between the
+		// walks: its snapshot (ggpo_advance_frame -> cb_save_game_state) is taken at the same point as the snapshots
+		// of re-simulated frames and as GGPO's first one (at the first ggpo_add_local_input), right before a task walk
+		if (g_advance_pending)
+		{
+			g_advance_pending = false;
+			ggpo_advance_frame(g_session);
+		}
+
 		// Network, and rollbacks (load + re-simulated frames through cb_advance_frame)
 		ggpo_idle(g_session, 0);
 
@@ -379,7 +397,15 @@ namespace rb::net
 		sync_inputs();
 		begin_frame();
 		run_task_walk(ppu, root);
-		ggpo_advance_frame(g_session);
+
+		if (t5dr_active())
+		{
+			g_advance_pending = true;
+		}
+		else
+		{
+			ggpo_advance_frame(g_session);
+		}
 
 		if (++g_frames % 600 == 0)
 		{

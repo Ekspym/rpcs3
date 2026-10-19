@@ -100,7 +100,12 @@ for the environment variables. Your ladder program starts RPCS3 with them:
    with calibrated ranges, 250+ rollbacks without a crash, saves/loads ~0.6 ms, ~33 ms per 7-frame rollback (re-simulated
    frames get an immediate vblank, `g_rb_vblank_kick`). Open: the sound thread (bnusCoreUpdateThread) crashed late in two
    long stress runs (after the recording ended); `RB_T5_FAST_RESIM=1` (no flip for re-simulated frames) crashes.*
-5. **Two instances on one PC.** NEXT STEP (not run yet). Copy `bin` to `bin2`; both: replay settings of the stress test
+5. **Two instances on one PC.** *First run 2026-10-19 (test_netplay_p1/p2.bat): both connected and started GGPO at game frame
+   2448, first rollback at 2450, then the RSX semaphore timed out and memory grew by ~10 GB within seconds (hang).
+   Cause: re-simulated frames only re-ran the task walk (Tekken 6 way), without the main loop code between two walks
+   (end of frame, flip, start of next frame), and GGPO's snapshots were taken after the walk while its first one was
+   taken before it. Fix: snapshots right before the walk (ggpo_advance_frame at the next boundary), re-simulated frames
+   run `t5dr_between_walks` (flip with an immediate vblank).* Original plan: Copy `bin` to `bin2`; both: replay settings of the stress test
    without `RB_SNAP_STRESS_*`, plus `RB_NET=1 RB_NET_INPUT=record RB_NET_START=+620 RB_NET_DELAY=2`; player 1
    `RB_NET_PLAYER=1 RB_NET_LOCAL_PORT=7000 RB_NET_REMOTE=127.0.0.1:7001`, player 2 the other way round. GGPO re-simulates
    inside one main loop iteration (rb_net.cpp cb_advance_frame), without flips. `RB_NET=1`, player 1 on 7000→7001, player 2 on 7001→7000, both with

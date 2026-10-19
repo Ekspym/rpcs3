@@ -2982,6 +2982,47 @@ namespace rb
 
 	const u32 s_t5_frame_end_index = REG_HIDDEN_FUNC(rb_t5_frame_end);
 
+	// Netplay re-simulation (rb_net.cpp cb_advance_frame): everything the main loop runs between two task walks, so a
+	// re-simulated frame is a whole main loop iteration like the frames of the stress test (end of the frame, flip,
+	// start of the next frame). Only re-running the task walk (the Tekken 6 way) left the graphics library without its
+	// per-frame work: the RSX semaphore timed out and its memory grew by gigabytes (two-instance test 2026-10-19).
+	// The flip does not wait for a vblank: one is posted right away (RSXThread.cpp), the frame limiter is lifted.
+	void t5dr_between_walks(ppu_thread& ppu)
+	{
+		using namespace t5dr;
+		const auto toc32 = [](s32 off) { return static_cast<u32>(toc + off); };
+
+		for (const u32 f : loop_tail)
+		{
+			t5_call(ppu, f);
+		}
+
+		const s32 counter = static_cast<s32>(vm::read32(vm::read32(toc32(toc_loop_counter_src))));
+		vm::write32(vm::read32(toc32(toc_loop_counter_dst)) + 96, static_cast<u32>(counter / 96));
+
+		const u32 obj = vm::read32(toc32(toc_loop_obj));
+		ppu.gpr[3] = obj;
+		ppu.gpr[4] = 0;
+		t5_call(ppu, loop_head_select);
+		t5_call(ppu, loop_head_pre);
+
+		const bool limit_was_off = g_disable_frame_limit;
+		g_disable_frame_limit = true;
+		g_rb_vblank_fast_poll = true;
+		g_rb_vblank_kick = 1;
+		t5_call(ppu, frame_end);
+		g_disable_frame_limit = limit_was_off;
+
+		ppu.gpr[3] = obj;
+		ppu.gpr[4] = 0;
+		t5_call(ppu, loop_head_select);
+
+		for (const u32 f : loop_head_post)
+		{
+			t5_call(ppu, f);
+		}
+	}
+
 	// RB_T5_RNGLOG=1 (diagnostics): the game's random generators are replaced by exact C++ copies that count their callers
 	// (call site = LR); every 300 fight frames the log lists the callers and how often they drew. Two runs that should be
 	// identical (clean replay vs. rewind / stress test) show which caller draws differently first.

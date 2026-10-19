@@ -56,6 +56,17 @@ namespace rb::t5dr
 	constexpr u32 frame_end_flip = 0x00355b70;
 	constexpr u32 frame_end_post = 0x00325060;
 	constexpr s32 toc_frame_end_post_arg = -3952;
+	// The main loop between two task walks (0x0001113c-0x00011190, then 0x000110f0-0x00011130): end of the frame
+	// (FUN_0009bcbc, FUN_000ab768, *(TOC-32676)+96 = **(TOC-32648) / 96), exit check FUN_00164ea4 (left out), start of
+	// the next (FUN_0025eda4(obj, 0), FUN_0025d5f0, frame end with the flip, FUN_0025eda4(obj, 0), FUN_0025cfe0,
+	// FUN_00143e44); obj = *(TOC-32684). r3 is passed from one call to the next, as in the loop.
+	constexpr u32 loop_tail[2] = {0x0009bcbc, 0x000ab768};
+	constexpr s32 toc_loop_obj = -32684;
+	constexpr s32 toc_loop_counter_dst = -32676;
+	constexpr s32 toc_loop_counter_src = -32648;
+	constexpr u32 loop_head_select = 0x0025eda4;
+	constexpr u32 loop_head_pre = 0x0025d5f0;
+	constexpr u32 loop_head_post[2] = {0x0025cfe0, 0x00143e44};
 	constexpr u32 key_latest = 0x00122360;     // patched: FUN_00122360(player) -> u16 game buttons of the frame (HLE)
 	constexpr u32 key_special = 0x0004174c;    // called first by FUN_00122360 in game mode 4 / sub mode 17
 	constexpr s32 toc_key_mode = -19012;       // TOC slot -> game mode struct (+0 mode, +16 sub mode)
