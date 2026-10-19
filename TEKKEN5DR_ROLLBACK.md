@@ -72,7 +72,9 @@ for the environment variables. Your ladder program starts RPCS3 with them:
    names) every time it changes. Note the class that appears when the round starts and leaves after the match.
    Put it in `RB_T5_SYNC_TASK` (substring match).
 3. **Determinism.** Same match twice with `RB_MODE=record` then `RB_MODE=replay` and `RB_HASH=<file>`.
-   The menus do not take the same number of frames each run (pads are read on the game's `keyread` thread), so use
+   The game reads the pads on its own `keyread` thread at vblank and takes the newest sample once per frame, so the
+   rollback hooks that per-frame read (`0x00122360`) instead of `cellPadGetData`: one input per player per game frame.
+   The menus do not take the same number of frames each run, so use
    `RB_T5_SYNC_TASK=tcb_swg_game_t` in both runs and `RB_REPLAY_FROM_SYNC=1` in the replay: drive the menus by hand to
    the same characters and stage, the recording takes over when the round starts. Bare file names (`RB_HASH=hash.txt`)
    are written to the RPCS3 config folder (next to `rpcs3.exe` on Windows).
@@ -100,6 +102,7 @@ for the environment variables. Your ladder program starts RPCS3 with them:
 | TOC (r2) | `0x00481000` |
 | main loop / loop body | `0x00011058` / `0x000110f0`–`0x00011190` |
 | frame end (GCM flip, flip status) | `0x00323d24` → `0x00355b70` → `0x0038ba58` → `0x003537c0` |
+| pad input (per frame) | thread `keyread` `0x00122450` (woken at vblank by `0x0025cf30`) → ring `*(TOC-19040)`; game reads newest entry via `0x00122360(player)` (hooked, `rb_t5_keys`), caller `0x00013140` |
 | task root | `*(0x00479054)` = `0x10622a80` |
 | task walk / list walk / node step / method call | `0x0025fca4` / `0x0025fba0` / `0x0025fa30` / `0x0025ebe4` |
 | task node | `+0x00` vtable, `+0x10` next, `+0x2c` step override, `+0x40` flags, `+0x4c` run count |

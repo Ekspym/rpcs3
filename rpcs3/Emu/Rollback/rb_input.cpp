@@ -456,10 +456,17 @@ namespace rb
 			return;
 		}
 
-		// Tekken 5 DR button mapping of the local controller (rb_t5dr.h), before anything else sees the data
-		if (port_no == 0 && data && g_t5dr)
+		// Tekken 5 DR: button mapping of the local controller (rb_t5dr.h), before anything else sees the data. The
+		// pads are read on the "keyread" thread at vblank, not once per game frame: record / replay / netplay take
+		// the game's own per-frame value instead (rb_t5_keys, FUN_00122360), so nothing else happens here.
+		if (g_t5dr)
 		{
-			t5dr::button_map::get().apply(*data);
+			if (port_no == 0 && data)
+			{
+				t5dr::button_map::get().apply(*data);
+			}
+
+			return;
 		}
 
 		on_pad_get_data_impl(port_no, data);
@@ -2485,8 +2492,7 @@ namespace rb
 				if (t5dr_class_name(vt).find(sync_task) != umax)
 				{
 					// Same as an RB_SYNC_ADDR sync point: recorded as a marker in record mode, realigns the replay
-					// The pads are read on the game's "keyread" thread, not on this one: the sync point is taken by the next
-					// port 0 read there, so the read counters are not changed under that thread's feet
+					// Taken by the next per-frame key read (rb_t5_keys, inside this frame's task walk)
 					rb_log.success("T5DR sync point: task %s (0x%08x) appeared at game frame %u", t5dr_class_name(vt), vt, g_state.seq[0]);
 					ensure_init();
 					g_t5dr_sync_pending = true;
@@ -2812,6 +2818,47 @@ namespace rb
 	// Tekken 5 DR (NPEA00019): only the frame hook. The rollback then runs through the netplay path (RB_NET=1,
 	// GGPO over direct UDP, both players' pads on ports 0 and 1 of an offline versus match); the Tekken 6 online
 	// module (rb_online) and the Tekken 6 specific render hooks are not used.
+	// Tekken 5 DR: replacement of FUN_00122360(player), the game's once-per-frame read of the newest keyread sample.
+	// The u16 it returns is carried in a CellPadData (digital1 = high byte, digital2 = low byte) through the normal
+	// pipeline (sync point, record / replay, GGPO), so the read counter is the game frame and every frame of a
+	// recording or of the opponent lands on the same game frame in every run.
+	u32 rb_t5_keys(ppu_thread& ppu, u32 player)
+	{
+		const u32 mode = vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_key_mode));
+
+		if (vm::read32(mode) == 4 && vm::read32(mode + 16) == 17)
+		{
+			const u64 old_r1 = ppu.gpr[1];
+			ppu.gpr[1] = (old_r1 - 0x100) & ~0xfull;
+			vm::write32(static_cast<u32>(ppu.gpr[1]), static_cast<u32>(old_r1));
+			ppu.fast_call(t5dr::key_special, t5dr::toc);
+			ppu.gpr[1] = old_r1;
+		}
+
+		// The original takes the ring lwmutex for this one halfword read; the store is a single halfword too
+		const u32 index = vm::read32(vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_key_index)));
+		const u32 ring = vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_key_ring));
+		u16 keys = vm::read16(ring + (((player & 1) * 16 + ((index - 1) & 15)) * 2));
+
+		if (player < max_ports)
+		{
+			CellPadData pad{};
+			pad.len = 24;
+			pad.button[CELL_PAD_BTN_OFFSET_DIGITAL1] = keys >> 8;
+			pad.button[CELL_PAD_BTN_OFFSET_DIGITAL2] = keys & 0xff;
+			on_pad_get_data_impl(player, &pad);
+
+			if (pad.len > 0)
+			{
+				keys = static_cast<u16>(((pad.button[CELL_PAD_BTN_OFFSET_DIGITAL1] & 0xff) << 8) | (pad.button[CELL_PAD_BTN_OFFSET_DIGITAL2] & 0xff));
+			}
+		}
+
+		return keys;
+	}
+
+	const u32 s_t5_keys_index = REG_HIDDEN_FUNC(rb_t5_keys);
+
 	void install_t5dr_hooks(std::vector<u32>& applied)
 	{
 		for (const t5dr::code_word& w : t5dr::code_signature)
@@ -2832,6 +2879,18 @@ namespace rb
 			g_frame_hook_installed = true;
 			g_t5dr = true;
 			rb_log.success("Tekken 5 DR frame hook: 0x%08x (task walk of the main loop) -> HLE 0x%08x", t5dr::task_walk, target);
+
+			const u32 keys_target = g_fxo->get<ppu_function_manager>().func_addr(s_t5_keys_index, true);
+
+			if (keys_target && ppu_form_branch_to_code(t5dr::key_latest, keys_target))
+			{
+				applied.push_back(t5dr::key_latest);
+				rb_log.success("Tekken 5 DR input hook: 0x%08x (newest key sample per frame) -> HLE 0x%08x", t5dr::key_latest, keys_target);
+			}
+			else
+			{
+				rb_log.error("Tekken 5 DR input hook could not be installed (target 0x%08x): inputs are not frame-exact", keys_target);
+			}
 		}
 		else
 		{

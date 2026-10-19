@@ -31,6 +31,13 @@
 //   task list        node+0x10 next, node+0x40 flags, node+0x4C run counter, node+0x00 vtable,
 //                    node+0x2C step override (OPD), otherwise vtable slot 2 (FUN_0025ebe4)
 //   pad device       vtable 0x1008CC60, read method FUN_0037d5d8 (cellPadGetData, raw path cellPadGetRawData)
+//   pad input        NOT read by the main loop: thread "keyread" (FUN_00122450) waits on a semaphore that the
+//                    GCM vblank handler FUN_0025cf30 posts (FUN_001220e0), reads both pads, converts them
+//                    (FUN_0008fd30) and writes one u16 per player into a 16-entry ring (*(TOC-19040),
+//                    index *(*(TOC-19052)), lwmutex *(TOC-19032)). The game takes the NEWEST ring entry once
+//                    per frame per player: FUN_00122360(player), only caller 0x00013140 (input task FUN_00012f38).
+//                    Which entry is the newest depends on vblank vs. frame timing, so the rollback works on the
+//                    value FUN_00122360 returns (key_latest hook), not on cellPadGetData.
 //   online VS mode   RTTI tcb_gm_netvs_t, vtable 0x10083928 (game's own delay-based netcode, FUN_00246xxx)
 //   game UDP         sendto wrapper FUN_00234b20, recvfrom wrapper FUN_00234d48
 //   TOC (r2)         0x00481000
@@ -42,6 +49,11 @@ namespace rb::t5dr
 	constexpr u32 task_walk = 0x0025fca4;      // patched: branch to the rollback frame step (HLE)
 	constexpr u32 task_walk_body = 0x0025fba0; // FUN_0025fba0(root, first, end): the list walk itself
 	constexpr u32 task_root_ptr = 0x00479054;  // TOC slot holding the root pointer (diagnostics)
+	constexpr u32 key_latest = 0x00122360;     // patched: FUN_00122360(player) -> u16 game buttons of the frame (HLE)
+	constexpr u32 key_special = 0x0004174c;    // called first by FUN_00122360 in game mode 4 / sub mode 17
+	constexpr s32 toc_key_mode = -19012;       // TOC slot -> game mode struct (+0 mode, +16 sub mode)
+	constexpr s32 toc_key_index = -19052;      // TOC slot -> u32 ring write counter
+	constexpr s32 toc_key_ring = -19040;       // TOC slot -> u16 ring[2][16]
 
 	// Instruction words that must be present before anything is patched (wrong build / region => no hooks)
 	struct code_word
@@ -59,6 +71,11 @@ namespace rb::t5dr
 		{0x0025fd04, 0x4bfffe9c}, // b FUN_0025fba0
 		{0x00011134, 0x4824eb71}, // bl FUN_0025fca4               (main loop call site)
 		{0x0025fba0, 0x38000070}, // li r0, 0x70                 (list walk entry)
+		{0x00122360, 0x38000070}, // li r0, 0x70                 (newest key sample, FUN_00122360)
+		{0x00122364, 0x8122b5bc}, // lwz r9, -19012(r2)
+		{0x001223ac, 0x8122b594}, // lwz r9, -19052(r2)
+		{0x001223cc, 0x8122b5a0}, // lwz r9, -19040(r2)
+		{0x00013140, 0x4810f221}, // bl FUN_00122360               (its only call site)
 	};
 
 	inline bool is_title(std::string_view id)
