@@ -78,6 +78,51 @@ namespace rb::t5dr
 		{0x00013140, 0x4810f221}, // bl FUN_00122360               (its only call site)
 	};
 
+	// Random number generators of the game (library code at 0x00370fd8..0x00371128). All are seeded with constants
+	// at boot (srand(12204) by 0x00124b14 / 0x00125cf8, LF2 seed 1893 by 0x000afc6c), but how far they have advanced
+	// at the fight start depends on what happened in the menus, so two runs (or two players) fight with different
+	// random numbers (win poses, effects, anything random). Both sides reseed them at the sync point (reseed_rngs).
+	constexpr u32 rng_rand_state = 0x10757218;  // FUN_00370fe4 rand(): x = x * 1103515245 + 12345
+	constexpr u32 rng_lf1_index = 0x1075721c;   // FUN_0037100c: additive lagged Fibonacci, 32 words
+	constexpr u32 rng_lf1_table = 0x10757220;
+	constexpr u32 rng_lf2_index = 0x107572a0;   // FUN_0037109c: multiplicative lagged Fibonacci, 32 words
+	constexpr u32 rng_lf2_table = 0x107572a4;
+	constexpr u32 rng_words = 32;
+
+	// Same as the game's own seeding functions FUN_0037105c / FUN_003710ec
+	inline void seed_lf(u32 index, u32 table, u32 seed)
+	{
+		u32 x = seed;
+
+		for (u32 i = 0; i < rng_words; i++)
+		{
+			x = x * 1103515245u + 12345u;
+			vm::write32(table + i * 4, x);
+		}
+
+		vm::write32(index, 0);
+	}
+
+	inline void reseed_rngs()
+	{
+		vm::write32(rng_rand_state, 12204);
+		seed_lf(rng_lf1_index, rng_lf1_table, 1893);
+		seed_lf(rng_lf2_index, rng_lf2_table, 1893);
+	}
+
+	// Small fingerprint of the generator states (diagnostics: equal in the record and the replay log)
+	inline u32 rng_fingerprint()
+	{
+		u32 h = vm::read32(rng_rand_state) * 0x9e3779b1u;
+
+		for (u32 a = rng_lf1_index; a < rng_lf2_table + rng_words * 4; a += 4)
+		{
+			h = (h ^ vm::read32(a)) * 0x01000193u;
+		}
+
+		return h;
+	}
+
 	inline bool is_title(std::string_view id)
 	{
 		return id == title_id;

@@ -41,6 +41,8 @@ extern bool ppu_form_branch_to_code(u32 entry, u32 target);
 
 namespace rb
 {
+	bool g_t5dr = false; // Tekken 5 DR (rb_t5dr.h): frame hook installed on its task walk
+
 	namespace
 	{
 		enum class mode_t { off, record, replay };
@@ -217,6 +219,13 @@ namespace rb
 		void check_sync_point()
 		{
 			g_state.synced = true;
+
+			// Tekken 5 DR: same random numbers from the fight start on in every run and on both PCs (rb_t5dr.h)
+			if (g_t5dr && get_env("RB_T5_RESEED") != "0")
+			{
+				rb_log.success("T5DR random generators reseeded at the sync point (were 0x%08x)", t5dr::rng_fingerprint());
+				t5dr::reseed_rngs();
+			}
 
 			if (g_state.mode == mode_t::record)
 			{
@@ -441,8 +450,6 @@ namespace rb
 			g_pad_mode = 0;
 		}
 	}
-
-	bool g_t5dr = false; // Tekken 5 DR (rb_t5dr.h): frame hook installed on its task walk
 
 	void on_pad_get_data(u32 port_no, CellPadData* data)
 	{
@@ -2456,6 +2463,19 @@ namespace rb
 	{
 		static const bool log = get_env("RB_T5_TASKLOG") == "1";
 		static const std::string sync_task = get_env("RB_T5_SYNC_TASK");
+
+		// Determinism check: fingerprint of the random generators every 300 game frames of the fight (compare the
+		// record and replay logs line by line: same frame, same value)
+		if (g_state.synced && g_state.seq[0] >= g_sync_frame && (g_state.seq[0] - g_sync_frame) % 300 == 0)
+		{
+			static u64 last = umax;
+
+			if (last != g_state.seq[0])
+			{
+				last = g_state.seq[0];
+				rb_log.notice("T5DR fight frame %u: rng 0x%08x", g_state.seq[0] - g_sync_frame, t5dr::rng_fingerprint());
+			}
+		}
 
 		if (!log && (sync_task.empty() || g_state.synced))
 		{
