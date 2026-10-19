@@ -2988,6 +2988,13 @@ namespace rb
 			{
 				g_save_at = sync + g_save_rel;
 				g_save_rel = umax;
+
+				// The stress test was scheduled from the (then unknown) save frame
+				if (g_stress_every)
+				{
+					g_next_rollback = g_save_at + (g_pattern.empty() ? g_stress_every : g_pattern[0].first);
+					rb_log.success("Snapshot stress test: first rollback at game frame %u", g_next_rollback);
+				}
 			}
 
 			if (g_cal_rel != umax)
