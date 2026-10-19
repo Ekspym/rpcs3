@@ -2908,6 +2908,22 @@ namespace rb
 		const u32 ring = vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_key_ring));
 		u16 keys = vm::read16(ring + (((player & 1) * 16 + ((index - 1) & 15)) * 2));
 
+		// RB_T5_KEYLOG=1 (menu scripting): every change of a player's game button word, with the game frame
+		if (static const bool keylog = get_env("RB_T5_KEYLOG") == "1"; keylog && player < 2)
+		{
+			static u16 last[2]{};
+			static u32 frames[2]{};
+
+			if (keys != last[player])
+			{
+				rb_log.notice("T5DR keys p%u: 0x%04x (was 0x%04x for %u frames) at game frame %u", player + 1, keys, last[player], frames[player], g_state.seq[0]);
+				last[player] = keys;
+				frames[player] = 0;
+			}
+
+			frames[player]++;
+		}
+
 		if (player == 0 && g_state.synced)
 		{
 			state_sample_fifo();
