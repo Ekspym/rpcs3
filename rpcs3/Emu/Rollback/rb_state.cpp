@@ -77,6 +77,7 @@ namespace rb
 		u64 g_save_rel = umax;   // RB_SNAP_SAVE_AT=+N
 		u64 g_cal_rel = umax;    // RB_SNAP_CALIBRATE_FROM=+N
 		u64 g_restore_at = umax;
+		u64 g_restore_rel = umax; // RB_SNAP_RESTORE_AT=+N
 		std::once_flag g_init;
 
 		// RB_SNAP_CALIBRATE_FROM: from this game frame until the save, every page of RB_SNAP_RANGES is
@@ -306,7 +307,14 @@ namespace rb
 				g_save_at = std::strtoull(save_at, nullptr, 10);
 			}
 
-			g_restore_at = std::strtoull(restore_at, nullptr, 10);
+			if (*restore_at == '+')
+			{
+				g_restore_rel = std::strtoull(restore_at + 1, nullptr, 10);
+			}
+			else
+			{
+				g_restore_at = std::strtoull(restore_at, nullptr, 10);
+			}
 
 			if (const char* stress = std::getenv("RB_SNAP_STRESS_EVERY"); stress && *stress)
 			{
@@ -2807,8 +2815,15 @@ namespace rb
 		}
 
 		// Frames relative to the sync point are resolved once it is known
-		if (const u64 sync = sync_game_frame(); sync != umax && (g_save_rel != umax || g_cal_rel != umax))
+		if (const u64 sync = sync_game_frame(); sync != umax && (g_save_rel != umax || g_cal_rel != umax || g_restore_rel != umax))
 		{
+			if (g_restore_rel != umax)
+			{
+				g_restore_at = sync + g_restore_rel;
+				g_restore_rel = umax;
+				rb_log.success("Snapshot: restore at game frame %u", g_restore_at);
+			}
+
 			if (g_save_rel != umax)
 			{
 				g_save_at = sync + g_save_rel;

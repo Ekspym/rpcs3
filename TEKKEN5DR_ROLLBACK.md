@@ -82,7 +82,12 @@ for the environment variables. Your ladder program starts RPCS3 with them:
    *and across both PCs*. If not, find the source with `RB_WATCH` / `RB_DUMP_FRAMES`. Usual causes:
    `sys_time_get_system_time` (4 callers: `0x0001047c`, `0x0034bad8`, `0x0034bb88`, `0x003c4f7c`; use
    `RB_FRAME_TIME_LR`), `cellRtc`, the timebase (`RB_VIRTUAL_TB=1`), SPURS jobs.
-4. **Snapshot ranges.** Start with calibrated ranges over the writable memory and write tracking:
+   *Done 2026-10-19: one round replayed identically (input hook `0x00122360` + random generators reseeded at the
+   sync point, `RB_T5_RESEED`).*
+4. **Snapshot ranges.** First test (replay of a recording): `RB_SNAP_RANGES=~0x00450000-0x00490000,~0x10000000-0x10b00000,~0x30000000-0x30300000,~0x50000000-0x55d00000,~0x59400000-0x59900000`,
+   `RB_SNAP_CALIBRATE_FROM=+0`, `RB_SNAP_SAVE_AT=+300`, `RB_SNAP_RESTORE_AT=+900` (`+N` = frames after the sync point),
+   `RB_SNAP_TRACK=1`. The hash file then has two samples of frames 300-900 after the sync point, which must be equal.
+   Older notes: Start with calibrated ranges over the writable memory and write tracking:
    `RB_SNAP_RANGES=~0x00450000-0x004A0000,~0x10050000-0x10770000,~0x20000000-0x40000000`, `RB_SNAP_TRACK=1`,
    `RB_SNAP_SAVE_AT=+60`, `RB_SNAP_RESTORE_AT=+600`. The restore test must continue the fight exactly as
    the replay (same hashes). Then the stress test (`RB_SNAP_STRESS_EVERY`) with prediction (`RB_SNAP_PREDICT=1`).
