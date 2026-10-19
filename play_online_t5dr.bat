@@ -12,7 +12,7 @@ set RB_NET_DELAY=%4
 if "%RB_NET_DELAY%"=="" set RB_NET_DELAY=2
 
 rem Fight start: fill in the task class found with RB_T5_TASKLOG=1 (calibration step 2)
-set RB_T5_SYNC_TASK=CHANGE_ME
+set RB_T5_SYNC_TASK=tcb_swg_game_t
 set RB_NET_START=+60
 
 rem Snapshots (calibration step 4)

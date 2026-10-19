@@ -2461,8 +2461,10 @@ namespace rb
 			{
 				if (t5dr_class_name(vt).find(sync_task) != umax)
 				{
-					force_sync_point("T5DR task");
+					// Same as an RB_SYNC_ADDR sync point: recorded as a marker in record mode, realigns the replay
 					rb_log.success("T5DR sync point: task %s (0x%08x) appeared", t5dr_class_name(vt), vt);
+					ensure_init();
+					check_sync_point();
 					break;
 				}
 			}

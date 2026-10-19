@@ -64,7 +64,10 @@ for the environment variables. Your ladder program starts RPCS3 with them:
 
 1. **Hook check.** Boot the game with the fork. The log must show
    `Tekken 5 DR frame hook: 0x0025fca4 ... -> HLE ...` and the game must play normally with `RB_NET` unset.
-2. **Find the fight task.** `RB_T5_TASKLOG=1`, play one Versus match. The log prints the task list (RTTI class
+2. **Find the fight task.** *Done (first test run): `tcb_swg_game_t` appears when the round goes live
+   (`tcb_selectmode_t` = character select, `tcb_gamemain_t` = match loading). Also found: after boot the game makes
+   no kernel changes (no memory allocation, mutex or thread creation) in menus, loading or fights, so snapshots stay
+   loadable the whole time.* Original step: `RB_T5_TASKLOG=1`, play one Versus match. The log prints the task list (RTTI class
    names) every time it changes. Note the class that appears when the round starts and leaves after the match.
    Put it in `RB_T5_SYNC_TASK` (substring match).
 3. **Determinism.** Same match twice with `RB_MODE=record` then `RB_MODE=replay` and `RB_HASH=<file>`
