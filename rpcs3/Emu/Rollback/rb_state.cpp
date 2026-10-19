@@ -248,18 +248,67 @@ namespace rb
 		}
 
 
-		// Render state that must not be rewound (RB_SNAP_EXCLUDE_IO, on by default for Tekken 5 DR, which renders on its main
-		// thread): RSX keeps executing the command buffers while the game is rolled back, so restoring them, or the game's
-		// GCM context (begin/end/current/callback) that points into them, makes the RSX run stale commands (first T5DR rewind
-		// test 2026-10-19: nv406e::semaphore_acquire time-outs right after the restore, broken picture, round intro replayed).
-		// Excluded: every 1 MiB block of main memory mapped for the RSX, and every GCM context found in the saved ranges.
+		std::vector<u32> g_fifo_blocks;
+		u32 g_fifo_shift = 20;          // block size of the FIFO exclusion: 1 MiB (Tekken 6), 64 KiB for Tekken 5 DR
+		std::vector<u32> g_fifo_seen;   // T5DR: blocks the RSX GET/PUT pointers were seen in since the sync point
+
+		// T5DR renders on its main thread from several command buffers in the RSX mapped memory, which also holds game
+		// objects (second rewind test 2026-10-19: excluding all of it crashed on a game object at 0x5076c8c0 right after
+		// the restore). The blocks the RSX actually reads commands from are learned instead: GET and PUT are sampled at
+		// every frame boundary and key read from the sync point to the first save, and all blocks between them.
+		void note_fifo_block(u32 ea)
+		{
+			if (ea != umax && std::find(g_fifo_seen.begin(), g_fifo_seen.end(), ea >> g_fifo_shift) == g_fifo_seen.end())
+			{
+				g_fifo_seen.push_back(ea >> g_fifo_shift);
+				rb_log.notice("Snapshot: RSX command block 0x%08x-0x%08x seen", (ea >> g_fifo_shift) << g_fifo_shift, ((ea >> g_fifo_shift) + 1) << g_fifo_shift);
+			}
+		}
+
+		void sample_fifo()
+		{
+			const auto render = rsx::get_current_renderer();
+
+			if (!render || !render->ctrl)
+			{
+				return;
+			}
+
+			const u32 get = render->iomap_table.get_addr(render->ctrl->get);
+			const u32 put = render->iomap_table.get_addr(render->ctrl->put);
+			note_fifo_block(get);
+			note_fifo_block(put);
+
+			// Commands between GET and PUT are still to be executed
+			if (get != umax && put != umax && get < put && put - get < 0x400000)
+			{
+				for (u32 a = get; a < put; a += 1u << g_fifo_shift)
+				{
+					note_fifo_block(a);
+				}
+			}
+		}
+
+
+		// Render state that must not be rewound (Tekken 5 DR, which renders on its main thread): RSX keeps executing the
+		// command buffers while the game is rolled back, so restoring them, or the game's GCM context (begin/end/current/
+		// callback) that points into them, makes the RSX run stale commands (first T5DR rewind test 2026-10-19:
+		// nv406e::semaphore_acquire time-outs right after the restore). Excluded: the GCM context found in the saved ranges,
+		// its command buffer and the 64 KiB blocks the RSX GET/PUT pointers visit (sample_fifo). RB_SNAP_EXCLUDE_IO=1 leaves
+		// all RSX mapped main memory alone instead (crashes T5DR: game objects live there too).
 		void exclude_render_state()
 		{
 			const char* v = std::getenv("RB_SNAP_EXCLUDE_IO");
+			const bool exclude_io = v && *v == '1';
 
-			if (v && *v ? *v != '1' : !t5dr_active())
+			if (!exclude_io && !t5dr_active())
 			{
 				return;
+			}
+
+			if (t5dr_active())
+			{
+				g_fifo_shift = 16;
 			}
 
 			const auto render = rsx::get_current_renderer();
@@ -293,8 +342,16 @@ namespace rb
 					j++;
 				}
 
-				g_excluded.push_back({blocks[i], blocks[j - 1] + 0x100000});
-				rb_log.success("Snapshot excludes 0x%08x-0x%08x (RSX mapped main memory)", blocks[i], blocks[j - 1] + 0x100000);
+				if (exclude_io)
+				{
+					g_excluded.push_back({blocks[i], blocks[j - 1] + 0x100000});
+					rb_log.success("Snapshot excludes 0x%08x-0x%08x (RSX mapped main memory)", blocks[i], blocks[j - 1] + 0x100000);
+				}
+				else
+				{
+					rb_log.notice("RSX mapped main memory 0x%08x-0x%08x (only its command blocks are left out)", blocks[i], blocks[j - 1] + 0x100000);
+				}
+
 				i = j;
 			}
 
@@ -313,12 +370,24 @@ namespace rb
 
 					const u32 begin = vm::read32(a), end = vm::read32(a + 4), current = vm::read32(a + 8);
 
+					const u32 callback = vm::read32(a + 12);
+
+					// A real context: callback is a function descriptor in the game's data (or an HLE one), not render data
 					if (begin < end && end - begin <= 0x4000000 && current >= begin && current <= end && current >= put && current - put < 0x100000 &&
+						callback && !(callback & 3) && callback < 0x50000000 && vm::check_addr<8>(callback, vm::page_readable) &&
 						std::any_of(blocks.begin(), blocks.end(), [&](u32 b) { return begin - b < 0x100000; }))
 					{
 						g_excluded.push_back({a, a + 16});
 						rb_log.success("Snapshot excludes the GCM context at 0x%08x (begin 0x%08x end 0x%08x current 0x%08x callback 0x%08x, RSX put 0x%08x)",
-							a, begin, end, current, +vm::read32(a + 12), put);
+							a, begin, end, current, callback, put);
+
+						// Its whole command buffer is RSX territory
+						for (u32 b = begin; b < end; b += 1u << g_fifo_shift)
+						{
+							note_fifo_block(b);
+						}
+
+						note_fifo_block(end - 1);
 						found++;
 					}
 				}
@@ -496,11 +565,9 @@ namespace rb
 		// The RSX command buffer must not be rewound: RSX keeps consuming it and dies with
 		// "Dead FIFO commands queue state". The whole IO mapped area (117 MiB in Tekken 6) also holds
 		// game objects, so only the 1 MiB blocks around the FIFO GET and PUT pointers are excluded.
-		std::vector<u32> g_fifo_blocks;
-
 		void update_fifo_blocks()
 		{
-			g_fifo_blocks.clear();
+			g_fifo_blocks = g_fifo_seen;
 			const auto render = rsx::get_current_renderer();
 
 			if (!render || !render->ctrl)
@@ -512,9 +579,9 @@ namespace rb
 			{
 				const u32 ea = render->iomap_table.get_addr(offs);
 
-				if (ea != umax && std::find(g_fifo_blocks.begin(), g_fifo_blocks.end(), ea >> 20) == g_fifo_blocks.end())
+				if (ea != umax && std::find(g_fifo_blocks.begin(), g_fifo_blocks.end(), ea >> g_fifo_shift) == g_fifo_blocks.end())
 				{
-					g_fifo_blocks.push_back(ea >> 20);
+					g_fifo_blocks.push_back(ea >> g_fifo_shift);
 					rb_log.notice("Snapshot: RSX FIFO offset 0x%x -> 0x%08x, block left untouched", offs, ea);
 				}
 			}
@@ -530,7 +597,7 @@ namespace rb
 				}
 			}
 
-			return std::find(g_fifo_blocks.begin(), g_fifo_blocks.end(), addr >> 20) != g_fifo_blocks.end();
+			return std::find(g_fifo_blocks.begin(), g_fifo_blocks.end(), addr >> g_fifo_shift) != g_fifo_blocks.end();
 		}
 
 		// Lightweight mutexes keep their lock state (owner, waiters) in guest memory, the kernel keeps the
@@ -720,7 +787,7 @@ namespace rb
 					const u32 page_end = std::min<u32>((addr & ~0xfffu) + 0x1000, r.end);
 					const u32 size = page_end - addr;
 
-					if (std::find(g_fifo_blocks.begin(), g_fifo_blocks.end(), addr >> 20) != g_fifo_blocks.end())
+					if (std::find(g_fifo_blocks.begin(), g_fifo_blocks.end(), addr >> g_fifo_shift) != g_fifo_blocks.end())
 					{
 						g_skipped_bytes += size;
 					}
@@ -1363,7 +1430,7 @@ namespace rb
 		{
 			std::vector<std::pair<u16, u16>> out;
 
-			if (!vm::check_addr(page, vm::page_readable) || std::find(g_fifo_blocks.begin(), g_fifo_blocks.end(), page >> 20) != g_fifo_blocks.end())
+			if (!vm::check_addr(page, vm::page_readable) || std::find(g_fifo_blocks.begin(), g_fifo_blocks.end(), page >> g_fifo_shift) != g_fifo_blocks.end())
 			{
 				return out;
 			}
@@ -2703,6 +2770,14 @@ namespace rb
 		g_spu_busy = std::move(check);
 	}
 
+	void state_sample_fifo()
+	{
+		if (!g_has_snapshot && g_fifo_shift != 20)
+		{
+			sample_fifo();
+		}
+	}
+
 	void state_exclude(u32 begin, u32 end, const char* what)
 	{
 		if (std::any_of(g_excluded.begin(), g_excluded.end(), [&](const range_t& r) { return r.begin == begin && r.end == end; }))
@@ -2927,6 +3002,11 @@ namespace rb
 		if (game_frame >= g_calibrate_from && game_frame < g_save_at && !g_has_snapshot)
 		{
 			calibrate_step();
+		}
+
+		if (!g_has_snapshot && g_fifo_shift != 20)
+		{
+			sample_fifo();
 		}
 
 		if (game_frame == g_save_at && !g_has_snapshot)

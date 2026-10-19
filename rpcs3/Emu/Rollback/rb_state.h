@@ -58,6 +58,8 @@ namespace rb
 	bool state_net_load(u64 game_frame, snapshot_info& out);
 	// Excludes a range from save/restore (like RB_SNAP_EXCLUDE); must be called before the sync point
 	void state_exclude(u32 begin, u32 end, const char* what);
+	// T5DR: sample the RSX GET/PUT pointers (command blocks left out of the snapshot), from the sync point to the first save
+	void state_sample_fifo();
 	// From any thread (HLE modules): queued, applied by the main thread at the next save or load
 	void state_exclude_async(u32 begin, u32 end, const char* what);
 	void state_unexclude_async(u32 begin, u32 end, const char* what);

@@ -2860,6 +2860,11 @@ namespace rb
 		const u32 ring = vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_key_ring));
 		u16 keys = vm::read16(ring + (((player & 1) * 16 + ((index - 1) & 15)) * 2));
 
+		if (player == 0 && g_state.synced)
+		{
+			state_sample_fifo();
+		}
+
 		if (player < max_ports)
 		{
 			CellPadData pad{};
