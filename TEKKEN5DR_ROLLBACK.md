@@ -87,6 +87,11 @@ for the environment variables. Your ladder program starts RPCS3 with them:
 4. **Snapshot ranges.** First test (replay of a recording): `RB_SNAP_RANGES=~0x00450000-0x00490000,~0x10000000-0x10b00000,~0x30000000-0x30300000,~0x50000000-0x55d00000,~0x59400000-0x59900000`,
    `RB_SNAP_CALIBRATE_FROM=+0`, `RB_SNAP_SAVE_AT=+300`, `RB_SNAP_RESTORE_AT=+900` (`+N` = frames after the sync point),
    `RB_SNAP_TRACK=1`. The hash file then has two samples of frames 300-900 after the sync point, which must be equal.
+   *Done 2026-10-19 (build be7cab4): full save of these ranges (no `~`) at +600, restore at +1200: the fight continued
+   identically (random generator fingerprints equal after the restore; remaining byte differences only in sound
+   buffers, timing counters and the GCM context, which are left alone on purpose). Calibrated (`~`) ranges miss pages
+   the fight first writes after the calibration (object pool at 0x10648000): for the per-frame ring, every page has to
+   be write-tracked. Full save costs ~19 ms.*
    Older notes: Start with calibrated ranges over the writable memory and write tracking:
    `RB_SNAP_RANGES=~0x00450000-0x004A0000,~0x10050000-0x10770000,~0x20000000-0x40000000`, `RB_SNAP_TRACK=1`,
    `RB_SNAP_SAVE_AT=+60`, `RB_SNAP_RESTORE_AT=+600`. The restore test must continue the fight exactly as
