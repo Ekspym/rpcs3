@@ -57,6 +57,7 @@ for the environment variables. Your ladder program starts RPCS3 with them:
 | `RB_NET_DELAY` | input delay frames (GGPO fork: max 3 predicted frames) |
 | `RB_NET_START=+N` | session starts N frames after the sync point |
 | `RB_T5_SYNC_TASK=<class>` | sync point = first frame with a task of that class (new, see below) |
+| `RB_T5_BUTTONS=L2=1+4,R2=3+4,...` | button mapping of the local controller (rb_t5dr.h), set by the launcher |
 | `RB_SNAP_RANGES`, `RB_SNAP_SAVE_AT`, `RB_SNAP_RESTORE_AT`, `RB_SNAP_TRACK` | snapshot setup (rb_state.h) |
 
 ## Calibration (to do with the game running)

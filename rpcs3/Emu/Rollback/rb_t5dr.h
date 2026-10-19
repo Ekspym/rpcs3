@@ -84,3 +84,126 @@ namespace rb::t5dr
 		ppu.gpr[1] = old_r1;
 	}
 }
+
+// ---------- Button mapping (RB_T5_BUTTONS) ----------
+// Applied to the local controller (port 0) before the game or the netplay sees it, so it works for pads and the
+// keyboard alike, offline and online. Format: "L1=2+3,L2=1+4,R1=1+2,R2=3+4,L3=1,SQUARE=none" with the sources
+// L1 L2 R1 R2 L3 R3 SQUARE TRIANGLE CROSS CIRCLE SELECT and the game buttons 1 (left punch, square),
+// 2 (right punch, triangle), 3 (left kick, cross), 4 (right kick, circle), START, or "none".
+// Buttons that are not listed keep their normal function.
+#include "Emu/Io/pad_types.h"
+#include <array>
+#include <cstdlib>
+#include <string>
+
+namespace rb::t5dr
+{
+	struct button_map
+	{
+		struct entry { int word; u16 bit; int press; };            // a physical button
+		struct action { u16 d1 = 0; u16 d2 = 0; bool mapped = false; };
+		std::array<action, 11> actions{};
+		bool any = false;
+
+		static constexpr entry sources[11] = {
+			{3, CELL_PAD_CTRL_L1, CELL_PAD_BTN_OFFSET_PRESS_L1}, {3, CELL_PAD_CTRL_L2, CELL_PAD_BTN_OFFSET_PRESS_L2},
+			{3, CELL_PAD_CTRL_R1, CELL_PAD_BTN_OFFSET_PRESS_R1}, {3, CELL_PAD_CTRL_R2, CELL_PAD_BTN_OFFSET_PRESS_R2},
+			{2, CELL_PAD_CTRL_L3, -1}, {2, CELL_PAD_CTRL_R3, -1},
+			{3, CELL_PAD_CTRL_SQUARE, CELL_PAD_BTN_OFFSET_PRESS_SQUARE}, {3, CELL_PAD_CTRL_TRIANGLE, CELL_PAD_BTN_OFFSET_PRESS_TRIANGLE},
+			{3, CELL_PAD_CTRL_CROSS, CELL_PAD_BTN_OFFSET_PRESS_CROSS}, {3, CELL_PAD_CTRL_CIRCLE, CELL_PAD_BTN_OFFSET_PRESS_CIRCLE},
+			{2, CELL_PAD_CTRL_SELECT, -1},
+		};
+
+		static int source_index(const std::string& s)
+		{
+			static const char* names[11] = {"L1", "L2", "R1", "R2", "L3", "R3", "SQUARE", "TRIANGLE", "CROSS", "CIRCLE", "SELECT"};
+			for (int i = 0; i < 11; i++) if (s == names[i]) return i;
+			return -1;
+		}
+
+		static button_map parse(const char* spec)
+		{
+			button_map m;
+			std::string s = spec ? spec : "";
+			usz pos = 0;
+
+			while (pos < s.size())
+			{
+				usz end = s.find(',', pos);
+				if (end == std::string::npos) end = s.size();
+				const std::string item = s.substr(pos, end - pos);
+				pos = end + 1;
+				const usz eq = item.find('=');
+				if (eq == std::string::npos) continue;
+				const int src = source_index(item.substr(0, eq));
+				if (src < 0) continue;
+
+				action a;
+				a.mapped = true;
+				const std::string what = item.substr(eq + 1);
+
+				if (what == "START")
+				{
+					a.d1 = CELL_PAD_CTRL_START;
+				}
+				else if (what != "none")
+				{
+					for (char c : what)
+					{
+						if (c == '1') a.d2 |= CELL_PAD_CTRL_SQUARE;
+						if (c == '2') a.d2 |= CELL_PAD_CTRL_TRIANGLE;
+						if (c == '3') a.d2 |= CELL_PAD_CTRL_CROSS;
+						if (c == '4') a.d2 |= CELL_PAD_CTRL_CIRCLE;
+					}
+				}
+
+				m.actions[src] = a;
+				m.any = true;
+			}
+
+			return m;
+		}
+
+		static const button_map& get()
+		{
+			static const button_map m = parse(std::getenv("RB_T5_BUTTONS"));
+			return m;
+		}
+
+		void apply(CellPadData& pad) const
+		{
+			if (!any) return;
+
+			const u16 in1 = pad.button[CELL_PAD_BTN_OFFSET_DIGITAL1];
+			const u16 in2 = pad.button[CELL_PAD_BTN_OFFSET_DIGITAL2];
+			u16 out1 = in1, out2 = in2;
+			u16 add1 = 0, add2 = 0;
+
+			// Remove every remapped source, then add what the pressed ones do
+			for (int i = 0; i < 11; i++)
+			{
+				if (!actions[i].mapped) continue;
+				const entry& e = sources[i];
+				const bool down = ((e.word == 2 ? in1 : in2) & e.bit) != 0;
+				(e.word == 2 ? out1 : out2) &= ~e.bit;
+				if (e.press >= 0) pad.button[e.press] = 0;
+				if (down) { add1 |= actions[i].d1; add2 |= actions[i].d2; }
+			}
+
+			out1 |= add1;
+			out2 |= add2;
+			pad.button[CELL_PAD_BTN_OFFSET_DIGITAL1] = out1;
+			pad.button[CELL_PAD_BTN_OFFSET_DIGITAL2] = out2;
+
+			// Pressure values of face buttons follow the digital state
+			const std::pair<u16, int> faces[4] = {
+				{CELL_PAD_CTRL_SQUARE, CELL_PAD_BTN_OFFSET_PRESS_SQUARE}, {CELL_PAD_CTRL_TRIANGLE, CELL_PAD_BTN_OFFSET_PRESS_TRIANGLE},
+				{CELL_PAD_CTRL_CROSS, CELL_PAD_BTN_OFFSET_PRESS_CROSS}, {CELL_PAD_CTRL_CIRCLE, CELL_PAD_BTN_OFFSET_PRESS_CIRCLE}};
+
+			for (const auto& [bit, press] : faces)
+			{
+				if (add2 & bit) pad.button[press] = 255;
+			}
+		}
+	};
+}

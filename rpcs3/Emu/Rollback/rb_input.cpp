@@ -440,6 +440,8 @@ namespace rb
 		}
 	}
 
+	bool g_t5dr = false; // Tekken 5 DR (rb_t5dr.h): frame hook installed on its task walk
+
 	void on_pad_get_data(u32 port_no, CellPadData* data)
 	{
 		if (native::g_pad_mode == 2)
@@ -450,6 +452,12 @@ namespace rb
 			}
 
 			return;
+		}
+
+		// Tekken 5 DR button mapping of the local controller (rb_t5dr.h), before anything else sees the data
+		if (port_no == 0 && data && g_t5dr)
+		{
+			t5dr::button_map::get().apply(*data);
 		}
 
 		on_pad_get_data_impl(port_no, data);
@@ -637,7 +645,6 @@ namespace rb
 	constexpr u64 tekken_toc = 0x0096A8B0;
 
 	bool g_frame_hook_installed = false;
-	bool g_t5dr = false; // Tekken 5 DR (rb_t5dr.h): frame hook installed on its task walk
 	void t5dr_task_diag(u32 root);
 
 	void rb_frame_step(ppu_thread& ppu, u32 root);
