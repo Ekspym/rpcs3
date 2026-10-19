@@ -968,6 +968,7 @@
     <ClInclude Include="Emu\Rollback\rb_input.h" />
     <ClInclude Include="Emu\Rollback\rb_checksum.h" />
     <ClInclude Include="Emu\Rollback\rb_state.h" />
+    <ClInclude Include="Emu\Rollback\rb_t5dr.h" />
     <ClInclude Include="Emu\Cell\Modules\cellPamf.h" />
     <ClInclude Include="Emu\Cell\Modules\cellPng.h" />
     <ClInclude Include="Emu\Cell\Modules\cellPngDec.h" />

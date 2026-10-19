@@ -2,6 +2,7 @@
 #include "rb_input.h"
 #include "rb_checksum.h"
 #include "rb_state.h"
+#include "rb_t5dr.h"
 
 #include "Emu/Cell/timers.hpp"
 #include "Emu/Cell/PPUThread.h"
@@ -636,6 +637,8 @@ namespace rb
 	constexpr u64 tekken_toc = 0x0096A8B0;
 
 	bool g_frame_hook_installed = false;
+	bool g_t5dr = false; // Tekken 5 DR (rb_t5dr.h): frame hook installed on its task walk
+	void t5dr_task_diag(u32 root);
 
 	void rb_frame_step(ppu_thread& ppu, u32 root);
 	const u32 s_frame_step_index = REG_HIDDEN_FUNC(rb_frame_step);
@@ -2156,9 +2159,19 @@ namespace rb
 			diag_before[k] = state_diag_us(static_cast<diag_t>(k));
 		}
 
+		if (g_t5dr)
+		{
+			t5dr_task_diag(root);
+		}
+
 		frame_boundary();
 		const auto t_state = std::chrono::steady_clock::now();
-		online::on_frame(ppu, root);
+
+		// The online module hooks Tekken 6's own online battle (fixed Tekken 6 addresses): not for other titles
+		if (!g_t5dr)
+		{
+			online::on_frame(ppu, root);
+		}
 
 		// RB_DEFER_HANDOFF: the previous live frame's frame end, now that its state is saved; dropped when this boundary
 		// loaded a snapshot (that frame was mispredicted and is not shown)
@@ -2242,7 +2255,7 @@ namespace rb
 
 		// Messages that arrived during this frame (its vblank wait) are received now, not in the next frame's tasks:
 		// a misprediction is found one frame earlier and rolled back at the next boundary
-		if (g_state.synced && !state_resimulating(g_state.seq[0]))
+		if (g_state.synced && !state_resimulating(g_state.seq[0]) && !g_t5dr)
 		{
 			online::end_of_frame(ppu);
 		}
@@ -2352,8 +2365,113 @@ namespace rb
 	}
 
 	// One frame of the main loop: the task walk of FUN_00100250 (see rb_frame_step)
+	bool t5dr_active()
+	{
+		return g_t5dr;
+	}
+
+	// Tekken 5 DR task list diagnostics and automatic sync point, at every main loop frame boundary:
+	//   RB_T5_TASKLOG=1        log the top level task list (class names from the game's RTTI) whenever it changes
+	//   RB_T5_SYNC_TASK=<name> the sync point (fight start, see RB_SYNC_ADDR) is the first frame in which a task whose
+	//                          class name contains <name> is in the list (e.g. a battle task found with RB_T5_TASKLOG)
+	std::string t5dr_class_name(u32 vtable)
+	{
+		// Itanium ABI: vtable[-1] = typeinfo, typeinfo + 4 = mangled name ("14tcb_gm_netvs_t")
+		if (!vm::check_addr<4>(vtable - 4))
+		{
+			return fmt::format("?%08x", vtable);
+		}
+
+		const u32 ti = vm::read32(vtable - 4);
+
+		if (!ti || !vm::check_addr<8>(ti))
+		{
+			return fmt::format("?%08x", vtable);
+		}
+
+		const u32 name = vm::read32(ti + 4);
+		std::string out;
+
+		for (u32 i = 0; i < 96 && vm::check_addr(name + i); i++)
+		{
+			const char c = static_cast<char>(*vm::get_super_ptr<u8>(name + i));
+
+			if (c == '\0')
+			{
+				break;
+			}
+
+			out += c;
+		}
+
+		// Drop the length prefix of a plain class name
+		usz digits = 0;
+
+		while (digits < out.size() && out[digits] >= '0' && out[digits] <= '9')
+		{
+			digits++;
+		}
+
+		return out.empty() ? fmt::format("?%08x", vtable) : (out[0] == 'N' ? out : out.substr(digits));
+	}
+
+	void t5dr_task_diag(u32 root)
+	{
+		static const bool log = get_env("RB_T5_TASKLOG") == "1";
+		static const std::string sync_task = get_env("RB_T5_SYNC_TASK");
+
+		if (!log && (sync_task.empty() || g_state.synced))
+		{
+			return;
+		}
+
+		std::vector<u32> vtables;
+		u32 node = vm::check_addr<0x14>(root) ? static_cast<u32>(vm::read32(root + 0x10)) : 0u;
+
+		for (u32 n = 0; node && node != root && n < 1024 && vm::check_addr<0x50>(node); n++)
+		{
+			vtables.push_back(vm::read32(node));
+			node = vm::read32(node + 0x10);
+		}
+
+		static std::vector<u32> last;
+
+		if (log && vtables != last)
+		{
+			std::string list;
+
+			for (const u32 vt : vtables)
+			{
+				list += fmt::format("%s%s(0x%08x)", list.empty() ? "" : ", ", t5dr_class_name(vt), vt);
+			}
+
+			rb_log.notice("T5DR tasks at game frame %u (%u): %s", g_state.seq[0], vtables.size(), list);
+		}
+
+		if (!sync_task.empty() && !g_state.synced && vtables != last)
+		{
+			for (const u32 vt : vtables)
+			{
+				if (t5dr_class_name(vt).find(sync_task) != umax)
+				{
+					force_sync_point("T5DR task");
+					rb_log.success("T5DR sync point: task %s (0x%08x) appeared", t5dr_class_name(vt), vt);
+					break;
+				}
+			}
+		}
+
+		last = std::move(vtables);
+	}
+
 	void run_task_walk(ppu_thread& ppu, u32 root)
 	{
+		if (g_t5dr)
+		{
+			t5dr::run_task_walk(ppu, root);
+			return;
+		}
+
 		// Own stack frame for the calls (FUN_000ff344 saves its LR into the caller frame)
 		const u64 old_r1 = ppu.gpr[1];
 		ppu.gpr[1] = (old_r1 - 0x100) & ~0xfull;
@@ -2657,11 +2775,52 @@ namespace rb
 #endif
 	}
 
+	// Tekken 5 DR (NPEA00019): only the frame hook. The rollback then runs through the netplay path (RB_NET=1,
+	// GGPO over direct UDP, both players' pads on ports 0 and 1 of an offline versus match); the Tekken 6 online
+	// module (rb_online) and the Tekken 6 specific render hooks are not used.
+	void install_t5dr_hooks(std::vector<u32>& applied)
+	{
+		for (const t5dr::code_word& w : t5dr::code_signature)
+		{
+			if (!vm::check_addr<4>(w.addr) || vm::read32(w.addr) != w.word)
+			{
+				rb_log.error("Tekken 5 DR: code at 0x%08x is 0x%08x, expected 0x%08x (different build or region?) - no rollback hooks",
+					w.addr, vm::check_addr<4>(w.addr) ? +vm::read32(w.addr) : 0u, w.word);
+				return;
+			}
+		}
+
+		const u32 target = g_fxo->get<ppu_function_manager>().func_addr(s_frame_step_index, true);
+
+		if (target && ppu_form_branch_to_code(t5dr::task_walk, target))
+		{
+			applied.push_back(t5dr::task_walk);
+			g_frame_hook_installed = true;
+			g_t5dr = true;
+			rb_log.success("Tekken 5 DR frame hook: 0x%08x (task walk of the main loop) -> HLE 0x%08x", t5dr::task_walk, target);
+		}
+		else
+		{
+			rb_log.error("Tekken 5 DR frame hook could not be installed (target 0x%08x)", target);
+		}
+	}
+
 	void install_static_hooks(std::vector<u32>& applied)
 	{
 		const char* v = std::getenv("RB_FRAME_HOOK");
 
-		if ((v && *v == '0') || Emu.GetTitleID() != "BLUS30359")
+		if (v && *v == '0')
+		{
+			return;
+		}
+
+		if (t5dr::is_title(Emu.GetTitleID()))
+		{
+			install_t5dr_hooks(applied);
+			return;
+		}
+
+		if (Emu.GetTitleID() != "BLUS30359")
 		{
 			return;
 		}

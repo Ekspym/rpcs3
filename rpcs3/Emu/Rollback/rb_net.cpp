@@ -217,7 +217,7 @@ namespace rb::net
 			cb.advance_frame = cb_advance_frame;
 			cb.on_event = cb_on_event;
 
-			if (const auto err = ggpo_start_session(&g_session, &cb, const_cast<char*>("tekken6"), 2, input_size, cfg.local_port); !GGPO_SUCCEEDED(err))
+			if (const auto err = ggpo_start_session(&g_session, &cb, const_cast<char*>(t5dr_active() ? "tekken5dr" : "tekken6"), 2, input_size, cfg.local_port); !GGPO_SUCCEEDED(err))
 			{
 				rb_net_log.fatal("ggpo_start_session failed: %d", static_cast<int>(err));
 				return false;

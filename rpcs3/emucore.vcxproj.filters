@@ -1911,6 +1911,9 @@
     <ClInclude Include="Emu\Rollback\rb_state.h">
       <Filter>Emu\Cell\Modules</Filter>
     </ClInclude>
+    <ClInclude Include="Emu\Rollback\rb_t5dr.h">
+      <Filter>Emu\Cell\Modules</Filter>
+    </ClInclude>
     <ClInclude Include="Emu\Cell\Modules\cellPamf.h">
       <Filter>Emu\Cell\Modules</Filter>
     </ClInclude>
