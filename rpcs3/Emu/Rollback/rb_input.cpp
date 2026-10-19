@@ -2282,6 +2282,25 @@ namespace rb
 		// The frame end at the start of the next iteration flips this frame only if it was a live one
 		g_t5_last_walk_resim = g_t5dr && g_state.synced && state_resimulating(g_boundary_frame);
 
+		// T5DR: the flip of a re-simulated frame (at the start of the next main loop iteration) runs without the frame
+		// limiter, so the re-simulated frames of a rollback are not held to 60 per second (RB_T5_RESIM_UNLIMITED=0: off)
+		if (g_t5dr)
+		{
+			static const bool unlimited = get_env("RB_T5_RESIM_UNLIMITED") != "0";
+			static bool lifted = false;
+
+			if (unlimited && g_t5_last_walk_resim && !g_disable_frame_limit)
+			{
+				g_disable_frame_limit = true;
+				lifted = true;
+			}
+			else if (lifted && !g_t5_last_walk_resim)
+			{
+				g_disable_frame_limit = false;
+				lifted = false;
+			}
+		}
+
 		if (slow_diag)
 		{
 			const auto now = std::chrono::steady_clock::now();
@@ -3037,7 +3056,10 @@ namespace rb
 				rb_log.success("Tekken 5 DR input hook: 0x%08x (newest key sample per frame) -> HLE 0x%08x", t5dr::key_latest, keys_target);
 			}
 
-			if (get_env("RB_T5_FAST_RESIM") != "0")
+			// RB_T5_FAST_RESIM=1: re-simulated frames skip the flip entirely. Crashed at the first rollback of the stress test
+			// (2026-10-19: a null callback in the graphics library, 0x00388444, whose per-frame queues are run by the flip),
+			// so off by default; the default lifts the frame limiter for re-simulated frames instead (see rb_frame_step)
+			if (get_env("RB_T5_FAST_RESIM") == "1")
 			{
 				const u32 end_target = g_fxo->get<ppu_function_manager>().func_addr(s_t5_frame_end_index, true);
 
