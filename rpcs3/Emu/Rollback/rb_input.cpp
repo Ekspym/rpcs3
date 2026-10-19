@@ -676,6 +676,7 @@ namespace rb
 
 	bool g_frame_hook_installed = false;
 	void t5dr_task_diag(u32 root);
+	void t5dr_frame_checks();
 
 	void rb_frame_step(ppu_thread& ppu, u32 root);
 	const u32 s_frame_step_index = REG_HIDDEN_FUNC(rb_frame_step);
@@ -2202,6 +2203,12 @@ namespace rb
 		}
 
 		frame_boundary();
+
+		if (g_t5dr)
+		{
+			t5dr_frame_checks();
+		}
+
 		const auto t_state = std::chrono::steady_clock::now();
 
 		// The online module hooks Tekken 6's own online battle (fixed Tekken 6 addresses): not for other titles
@@ -3252,8 +3259,30 @@ namespace rb
 		}
 	}
 
+	// T5DR: checksums / dumps / trace windows at the frame boundary (main thread, after a possible restore, before the
+	// task walk): the state at the end of game frame seq - 1, the same point in every pass
+	void t5dr_frame_checks()
+	{
+		static u64 last = umax;
+
+		if (g_state.seq[0] && g_state.seq[0] != last)
+		{
+			last = g_state.seq[0];
+			g_game_frame = g_state.seq[0];
+			trace_window(g_state.seq[0] - 1);
+			checksum_on_frame(g_state.seq[0] - 1);
+		}
+	}
+
 	void after_pad_get_data(u32 port_no)
 	{
+		// Tekken 5 DR: the pads are read on the keyread thread, at any point of the main thread's frame; hashes and dumps are
+		// taken at the frame boundary on the main thread instead (t5dr_frame_checks)
+		if (g_t5dr)
+		{
+			return;
+		}
+
 		// The first pad read of a game frame is the frame boundary
 		static u64 last_reads = 0;
 
