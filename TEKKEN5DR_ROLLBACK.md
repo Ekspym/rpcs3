@@ -105,7 +105,12 @@ for the environment variables. Your ladder program starts RPCS3 with them:
    Cause: re-simulated frames only re-ran the task walk (Tekken 6 way), without the main loop code between two walks
    (end of frame, flip, start of next frame), and GGPO's snapshots were taken after the walk while its first one was
    taken before it. Fix: snapshots right before the walk (ggpo_advance_frame at the next boundary), re-simulated frames
-   run `t5dr_between_walks` (flip with an immediate vblank).* Original plan: Copy `bin` to `bin2`; both: replay settings of the stress test
+   run `t5dr_between_walks` (flip with an immediate vblank).*
+   *Passed 2026-10-19 (build 6ca1389, mirror match, both pads on one controller): ~4400 frames of GGPO play, ping ~17 ms,
+   no hang, no memory growth, both windows showed the same fight and end state; random generator fingerprints equal.
+   Full-memory hash files cannot be compared across two processes (~2300 pages differ even before the session); a
+   fight-state fingerprint exchanged during the match (health, positions, timer) is the next step for desync checks.*
+   Original plan: Copy `bin` to `bin2`; both: replay settings of the stress test
    without `RB_SNAP_STRESS_*`, plus `RB_NET=1 RB_NET_INPUT=record RB_NET_START=+620 RB_NET_DELAY=2`; player 1
    `RB_NET_PLAYER=1 RB_NET_LOCAL_PORT=7000 RB_NET_REMOTE=127.0.0.1:7001`, player 2 the other way round. GGPO re-simulates
    inside one main loop iteration (rb_net.cpp cb_advance_frame), without flips. `RB_NET=1`, player 1 on 7000→7001, player 2 on 7001→7000, both with
