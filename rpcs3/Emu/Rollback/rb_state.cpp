@@ -247,6 +247,89 @@ namespace rb
 			return h0 ^ (h1 * 0x9E3779B97F4A7C15);
 		}
 
+
+		// Render state that must not be rewound (RB_SNAP_EXCLUDE_IO, on by default for Tekken 5 DR, which renders on its main
+		// thread): RSX keeps executing the command buffers while the game is rolled back, so restoring them, or the game's
+		// GCM context (begin/end/current/callback) that points into them, makes the RSX run stale commands (first T5DR rewind
+		// test 2026-10-19: nv406e::semaphore_acquire time-outs right after the restore, broken picture, round intro replayed).
+		// Excluded: every 1 MiB block of main memory mapped for the RSX, and every GCM context found in the saved ranges.
+		void exclude_render_state()
+		{
+			const char* v = std::getenv("RB_SNAP_EXCLUDE_IO");
+
+			if (v && *v ? *v != '1' : !t5dr_active())
+			{
+				return;
+			}
+
+			const auto render = rsx::get_current_renderer();
+
+			if (!render || !render->ctrl)
+			{
+				rb_log.error("Snapshot: RSX not ready, render state not excluded");
+				return;
+			}
+
+			std::vector<u32> blocks;
+
+			for (u32 i = 0; i < render->iomap_table.ea.size(); i++)
+			{
+				const u32 ea = render->iomap_table.ea[i];
+
+				if (ea != umax)
+				{
+					blocks.push_back(ea & ~0xfffffu);
+				}
+			}
+
+			std::sort(blocks.begin(), blocks.end());
+
+			for (usz i = 0; i < blocks.size();)
+			{
+				usz j = i + 1;
+
+				while (j < blocks.size() && blocks[j] == blocks[j - 1] + 0x100000)
+				{
+					j++;
+				}
+
+				g_excluded.push_back({blocks[i], blocks[j - 1] + 0x100000});
+				rb_log.success("Snapshot excludes 0x%08x-0x%08x (RSX mapped main memory)", blocks[i], blocks[j - 1] + 0x100000);
+				i = j;
+			}
+
+			const u32 put = render->iomap_table.get_addr(render->ctrl->put);
+			u32 found = 0;
+
+			for (const range_t& r : g_ranges)
+			{
+				for (u32 a = r.begin; a + 16 <= r.end && found < 8; a += 4)
+				{
+					if (!vm::check_addr<16>(a, vm::page_readable))
+					{
+						a = (a | 0xfff) - 3;
+						continue;
+					}
+
+					const u32 begin = vm::read32(a), end = vm::read32(a + 4), current = vm::read32(a + 8);
+
+					if (begin < end && end - begin <= 0x4000000 && current >= begin && current <= end && current >= put && current - put < 0x100000 &&
+						std::any_of(blocks.begin(), blocks.end(), [&](u32 b) { return begin - b < 0x100000; }))
+					{
+						g_excluded.push_back({a, a + 16});
+						rb_log.success("Snapshot excludes the GCM context at 0x%08x (begin 0x%08x end 0x%08x current 0x%08x callback 0x%08x, RSX put 0x%08x)",
+							a, begin, end, current, +vm::read32(a + 12), put);
+						found++;
+					}
+				}
+			}
+
+			if (!found)
+			{
+				rb_log.error("Snapshot: no GCM context found near RSX put 0x%08x", put);
+			}
+		}
+
 		void init()
 		{
 			const char* list = std::getenv("RB_SNAP_RANGES");
@@ -396,6 +479,8 @@ namespace rb
 					rb_log.success("Snapshot calibration from game frame %u", g_calibrate_from);
 				}
 			}
+
+			exclude_render_state();
 
 			usz total = 0;
 			for (const range_t& r : g_ranges)
