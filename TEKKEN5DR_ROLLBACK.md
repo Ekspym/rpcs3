@@ -1,8 +1,26 @@
 # Tekken 5 Dark Resurrection rollback (RPCS3 fork)
 
-Port of the Tekken 6 rollback (`TEKKEN6_ROLLBACK.md`, branch `tekken6-rollback`) to
+Port of Ekspym's Tekken 6 rollback ([Ekspym/rpcs3](https://github.com/Ekspym/rpcs3), branch `tekken6-rollback`) to
 **Tekken 5: Dark Resurrection Online, PSN, Europe – NPEA00019** (`EP9000-NPEA00019_00-TEKKENRETAIL0000`).
-Branch: `tekken5dr-rollback`. Same build steps as Tekken 6 (GGPO static lib side by side, then `rpcs3.sln`).
+Branch: `tekken5dr-rollback`. The rollback lives in `rpcs3/Emu/Rollback/`; the remaining changes are small hooks
+in the emulator. RPCS3 and the rollback changes are licensed under GPLv2 (see `LICENSE`).
+
+## Building (Windows, Visual Studio)
+
+The repositories are expected side by side:
+
+```
+<dir>/rpcs3      this fork, branch tekken5dr-rollback (git submodule update --init --recursive)
+<dir>/ggpo       https://github.com/Ekspym/ggpo, branch tekken6-rollback
+```
+
+1. GGPO as a static library with the static CRT, into `ggpo/build_rb`:
+   `cmake -S ggpo -B ggpo/build_rb -A x64 -DBUILD_SHARED_LIBS=OFF` (the branch sets `/MT`),
+   then `cmake --build ggpo/build_rb --config Release`.
+   The linker finds `GGPO.lib` in `ggpo/build_rb/lib/x64/Release`.
+2. RPCS3 as described in `BUILDING.md` (`rpcs3.sln`, Release x64).
+
+The game and the PS3 firmware are not part of this repository.
 
 > **Status: first port, not yet tested in game.** The hooks come from static analysis of the decrypted
 > EBOOT. Everything below the "Calibration" heading has to be done with the game running before two
