@@ -113,6 +113,7 @@ namespace rb
 
 		std::vector<u64> g_dump_frames;
 		std::string g_dump_prefix;
+		std::vector<std::pair<u32, u32>> g_dump_ranges; // RB_DUMP_RANGES=0xBEGIN-0xEND,...: only these pages (smaller files)
 
 		void init_dump()
 		{
@@ -129,8 +130,22 @@ namespace rb
 				g_dump_frames.push_back(std::strtoull(item.c_str(), nullptr, 10));
 			}
 
-			g_dump_prefix = prefix;
+			g_dump_prefix = out_path(prefix);
 			rb_log.success("Dumping memory at %u game frames to '%s_<frame>.bin'", g_dump_frames.size(), g_dump_prefix);
+
+			if (const char* ranges = std::getenv("RB_DUMP_RANGES"); ranges && *ranges)
+			{
+				for (const std::string& item : fmt::split(ranges, {","}))
+				{
+					const auto parts = fmt::split(item, {"-"});
+
+					if (parts.size() == 2)
+					{
+						g_dump_ranges.emplace_back(static_cast<u32>(std::strtoul(parts[0].c_str(), nullptr, 16)), static_cast<u32>(std::strtoul(parts[1].c_str(), nullptr, 16)));
+						rb_log.success("Dump range 0x%08x-0x%08x", g_dump_ranges.back().first, g_dump_ranges.back().second);
+					}
+				}
+			}
 		}
 
 		// File: "RBDM", u32 version 1, u64 game frame, then records of u32 page index + 4096 bytes
@@ -172,6 +187,11 @@ namespace rb
 						continue;
 					}
 
+					if (!g_dump_ranges.empty() && std::none_of(g_dump_ranges.begin(), g_dump_ranges.end(), [&](const auto& r) { return addr >= r.first && addr < r.second; }))
+					{
+						continue;
+					}
+
 					const u32 page = static_cast<u32>(addr / page_size);
 					append(&page, sizeof(page));
 					append(vm::g_sudo_addr + addr, page_size);
@@ -191,12 +211,14 @@ namespace rb
 		void init_watch()
 		{
 			const char* list = std::getenv("RB_WATCH");
-			const char* path = std::getenv("RB_WATCH_OUT");
+			const char* path_env = std::getenv("RB_WATCH_OUT");
 
-			if (!list || !*list || !path || !*path)
+			if (!list || !*list || !path_env || !*path_env)
 			{
 				return;
 			}
+
+			const std::string path = out_path(path_env);
 
 			for (const std::string& item : fmt::split(list, {","}))
 			{
@@ -280,12 +302,14 @@ namespace rb
 			init_watch();
 			init_dump();
 
-			const char* path = std::getenv("RB_HASH");
+			const char* path_env = std::getenv("RB_HASH");
 
-			if (!path || !*path)
+			if (!path_env || !*path_env)
 			{
 				return;
 			}
+
+			const std::string path = out_path(path_env);
 
 			g_every = std::max<u64>(env_u64("RB_HASH_EVERY", 60), 1);
 			g_from = env_u64("RB_HASH_FROM", 0);
@@ -378,7 +402,7 @@ namespace rb
 	{
 		if (g_dump_prefix.empty())
 		{
-			g_dump_prefix = prefix;
+			g_dump_prefix = out_path(prefix);
 		}
 
 		dump_memory(game_frame);

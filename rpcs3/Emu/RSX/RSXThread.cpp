@@ -44,6 +44,10 @@ atomic_t<bool> g_user_asked_for_recording = false;
 atomic_t<bool> g_user_asked_for_screenshot = false;
 atomic_t<bool> g_user_asked_for_frame_capture = false;
 atomic_t<bool> g_disable_frame_limit = false;
+// Rollback (Tekken 5 DR): a re-simulated frame asks for one vblank right away instead of waiting for the next one, so the
+// game's per-frame vblank wait does not hold the re-simulated frames of a rollback to 60 per second
+atomic_t<u32> g_rb_vblank_kick = 0;
+atomic_t<bool> g_rb_vblank_fast_poll = false;
 rsx::frame_trace_data frame_debug;
 rsx::frame_capture_data frame_capture;
 
@@ -1197,6 +1201,14 @@ namespace rsx
 				// Calculate time remaining to that time (0 if we passed it)
 				const u64 wait_for = current >= post_event_time ? 0 : post_event_time - current;
 
+				// Rollback: an extra vblank requested by a re-simulated frame
+				if (g_rb_vblank_kick && wait_for)
+				{
+					g_rb_vblank_kick = 0;
+					post_vblank_event(current);
+					continue;
+				}
+
 #ifdef __linux__
 				const u64 wait_sleep = wait_for;
 #else
@@ -1227,7 +1239,8 @@ namespace rsx
 				}
 				else if (wait_sleep)
 				{
-					thread_ctrl::wait_for(wait_sleep);
+					// Rollback: short sleeps, so a requested extra vblank is posted within ~1 ms
+					thread_ctrl::wait_for(g_rb_vblank_fast_poll ? std::min<u64>(wait_sleep, 1000) : wait_sleep);
 				}
 				else if (wait_for >= host_min_quantum / 3 * 2)
 				{

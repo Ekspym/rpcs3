@@ -2,6 +2,7 @@
 #include "rb_input.h"
 #include "rb_checksum.h"
 #include "rb_state.h"
+#include "rb_t5dr.h"
 
 #include "Emu/Cell/timers.hpp"
 #include "Emu/Cell/PPUThread.h"
@@ -9,6 +10,7 @@
 #include "Emu/Cell/PPUModule.h"
 #include "Emu/System.h"
 #include "Emu/RSX/RSXThread.h"
+#include "Emu/RSX/Overlays/overlay_message.h"
 #include "Emu/system_config.h"
 #include "Emu/IdManager.h"
 #include "Emu/Io/pad_types.h"
@@ -40,6 +42,15 @@ extern bool ppu_form_branch_to_code(u32 entry, u32 target);
 
 namespace rb
 {
+	bool g_t5dr = false; // Tekken 5 DR (rb_t5dr.h): frame hook installed on its task walk
+	bool g_t5_last_walk_resim = false; // T5DR: the previous main loop iteration's task walk was a re-simulated frame
+
+	namespace t5p
+	{
+		bool enabled();
+		void boundary();
+	}
+
 	namespace
 	{
 		enum class mode_t { off, record, replay };
@@ -76,6 +87,7 @@ namespace rb
 			u32 sync_addr = 0;
 			u32 sync_frame = 0; // RB_SYNC_FRAME: sync point at this port 0 read (recordings without the LCG seed)
 			bool synced = false;
+			bool replay_from_sync = false; // RB_REPLAY_FROM_SYNC=1: live input until the sync point, the recording after it
 			s64 recorded_sync_seq[max_ports]{-1, -1};
 		};
 
@@ -152,10 +164,11 @@ namespace rb
 		void init()
 		{
 			const std::string mode = get_env("RB_MODE");
-			std::string path = get_env("RB_FILE");
-			const std::string stats_path = get_env("RB_STATS");
+			std::string path = out_path(get_env("RB_FILE"));
+			const std::string stats_path = out_path(get_env("RB_STATS"));
 			g_state.sync_addr = static_cast<u32>(std::strtoul(get_env("RB_SYNC_ADDR").c_str(), nullptr, 16));
 			g_state.sync_frame = static_cast<u32>(std::strtoul(get_env("RB_SYNC_FRAME").c_str(), nullptr, 10));
+			g_state.replay_from_sync = get_env("RB_REPLAY_FROM_SYNC") == "1";
 
 			// RB_NET_DUMP=1: every UDP packet of the game in the log (sys_net_dump trace) plus a marker per main loop frame
 			if (get_env("RB_NET_DUMP") == "1")
@@ -214,6 +227,18 @@ namespace rb
 		void check_sync_point()
 		{
 			g_state.synced = true;
+
+			// Tekken 5 DR: same random numbers from the fight start on in every run and on both PCs (rb_t5dr.h)
+			if (g_t5dr && get_env("RB_T5_RESEED") != "0")
+			{
+				rb_log.success("T5DR random generators reseeded at the sync point (were 0x%08x)", t5dr::rng_fingerprint());
+				t5dr::reseed_rngs();
+			}
+
+			if (g_t5dr)
+			{
+				state_exclude(t5dr::render_fence, t5dr::render_fence_end, "T5DR GPU frame fence");
+			}
 
 			if (g_state.mode == mode_t::record)
 			{
@@ -451,6 +476,19 @@ namespace rb
 			return;
 		}
 
+		// Tekken 5 DR: button mapping of the local controller (rb_t5dr.h), before anything else sees the data. The
+		// pads are read on the "keyread" thread at vblank, not once per game frame: record / replay / netplay take
+		// the game's own per-frame value instead (rb_t5_keys, FUN_00122360), so nothing else happens here.
+		if (g_t5dr)
+		{
+			if (port_no == 0 && data)
+			{
+				t5dr::button_map::get().apply(*data);
+			}
+
+			return;
+		}
+
 		on_pad_get_data_impl(port_no, data);
 
 		if (native::g_pad_mode == 1)
@@ -458,6 +496,8 @@ namespace rb
 			native::g_pad_reads.emplace_back(port_no, *data);
 		}
 	}
+
+	std::atomic<bool> g_t5dr_sync_pending{false}; // set by the task walk (main thread) when the sync task appears
 
 	void on_pad_get_data_impl(u32 port_no, CellPadData* data)
 	{
@@ -475,7 +515,7 @@ namespace rb
 			g_port0_reads++;
 		}
 
-		if (port_no == 0 && !g_state.synced && ((g_state.sync_frame && g_state.seq[0] >= g_state.sync_frame) ||
+		if (port_no == 0 && !g_state.synced && (g_t5dr_sync_pending.load() || (g_state.sync_frame && g_state.seq[0] >= g_state.sync_frame) ||
 			(g_state.sync_addr && vm::check_addr<4>(g_state.sync_addr, vm::page_readable) && *vm::get_super_ptr<u32>(g_state.sync_addr) != 0u)))
 		{
 			check_sync_point();
@@ -582,6 +622,13 @@ namespace rb
 		}
 		case mode_t::replay:
 		{
+			// Menus and loading do not take the same number of frames every run (Tekken 5 DR): with RB_REPLAY_FROM_SYNC the
+			// player navigates the menus to the same fight and the recording takes over at the sync point (fight start)
+			if (g_state.replay_from_sync && !g_state.synced)
+			{
+				break;
+			}
+
 			const auto& records = g_state.replay[port_no];
 
 			if (seq >= records.size())
@@ -636,6 +683,9 @@ namespace rb
 	constexpr u64 tekken_toc = 0x0096A8B0;
 
 	bool g_frame_hook_installed = false;
+	void t5dr_task_diag(u32 root);
+	void t5dr_frame_checks();
+	std::string rng_calls_text();
 
 	void rb_frame_step(ppu_thread& ppu, u32 root);
 	const u32 s_frame_step_index = REG_HIDDEN_FUNC(rb_frame_step);
@@ -2156,9 +2206,25 @@ namespace rb
 			diag_before[k] = state_diag_us(static_cast<diag_t>(k));
 		}
 
+		if (g_t5dr)
+		{
+			t5dr_task_diag(root);
+		}
+
 		frame_boundary();
+
+		if (g_t5dr)
+		{
+			t5dr_frame_checks();
+		}
+
 		const auto t_state = std::chrono::steady_clock::now();
-		online::on_frame(ppu, root);
+
+		// The online module hooks Tekken 6's own online battle (fixed Tekken 6 addresses): not for other titles
+		if (!g_t5dr)
+		{
+			online::on_frame(ppu, root);
+		}
 
 		// RB_DEFER_HANDOFF: the previous live frame's frame end, now that its state is saved; dropped when this boundary
 		// loaded a snapshot (that frame was mispredicted and is not shown)
@@ -2214,10 +2280,45 @@ namespace rb
 			}
 		}
 
+		// T5DR practice tools: position save / reset, frame data (before the task walk, like the netplay snapshots)
+		if (g_t5dr && t5p::enabled())
+		{
+			t5p::boundary();
+		}
+
 		// Netplay runs the frame itself (GGPO input exchange, rollbacks with re-simulated frames)
 		if (!net::run_frame(ppu, root, g_state.seq[0]))
 		{
 			run_task_walk(ppu, root);
+		}
+
+		// The frame end at the start of the next iteration flips this frame only if it was a live one
+		g_t5_last_walk_resim = g_t5dr && g_state.synced && state_resimulating(g_boundary_frame);
+
+		// T5DR: the flip of a re-simulated frame (at the start of the next main loop iteration) runs without the frame
+		// limiter, so the re-simulated frames of a rollback are not held to 60 per second (RB_T5_RESIM_UNLIMITED=0: off)
+		if (g_t5dr)
+		{
+			static const bool unlimited = get_env("RB_T5_RESIM_UNLIMITED") != "0";
+			static bool lifted = false;
+
+			// ... and does not wait for the next vblank either: one extra vblank is posted right away (RSXThread.cpp)
+			if (unlimited && g_t5_last_walk_resim)
+			{
+				g_rb_vblank_fast_poll = true;
+				g_rb_vblank_kick = 1;
+			}
+
+			if (unlimited && g_t5_last_walk_resim && !g_disable_frame_limit)
+			{
+				g_disable_frame_limit = true;
+				lifted = true;
+			}
+			else if (lifted && !g_t5_last_walk_resim)
+			{
+				g_disable_frame_limit = false;
+				lifted = false;
+			}
 		}
 
 		if (slow_diag)
@@ -2242,7 +2343,7 @@ namespace rb
 
 		// Messages that arrived during this frame (its vblank wait) are received now, not in the next frame's tasks:
 		// a misprediction is found one frame earlier and rolled back at the next boundary
-		if (g_state.synced && !state_resimulating(g_state.seq[0]))
+		if (g_state.synced && !state_resimulating(g_state.seq[0]) && !g_t5dr)
 		{
 			online::end_of_frame(ppu);
 		}
@@ -2352,8 +2453,146 @@ namespace rb
 	}
 
 	// One frame of the main loop: the task walk of FUN_00100250 (see rb_frame_step)
+	// Output files given as a bare name (RB_HASH=hash.txt) were opened relative to the working directory, which can be
+	// a folder RPCS3 cannot write to ("Checksum file 'hash_replay.txt' cannot be created", T5DR test 2026-10-19)
+	std::string out_path(const std::string& path)
+	{
+		if (path.empty() || path[0] == '/' || path[0] == '\\' || path.find(':') != std::string::npos)
+		{
+			return path;
+		}
+
+		return fs::get_config_dir() + path;
+	}
+
+	bool t5dr_active()
+	{
+		return g_t5dr;
+	}
+
+	// Tekken 5 DR task list diagnostics and automatic sync point, at every main loop frame boundary:
+	//   RB_T5_TASKLOG=1        log the top level task list (class names from the game's RTTI) whenever it changes
+	//   RB_T5_SYNC_TASK=<name> the sync point (fight start, see RB_SYNC_ADDR) is the first frame in which a task whose
+	//                          class name contains <name> is in the list (e.g. a battle task found with RB_T5_TASKLOG)
+	std::string t5dr_class_name(u32 vtable)
+	{
+		// Itanium ABI: vtable[-1] = typeinfo, typeinfo + 4 = mangled name ("14tcb_gm_netvs_t")
+		if (!vm::check_addr<4>(vtable - 4))
+		{
+			return fmt::format("?%08x", vtable);
+		}
+
+		const u32 ti = vm::read32(vtable - 4);
+
+		if (!ti || !vm::check_addr<8>(ti))
+		{
+			return fmt::format("?%08x", vtable);
+		}
+
+		const u32 name = vm::read32(ti + 4);
+		std::string out;
+
+		for (u32 i = 0; i < 96 && vm::check_addr(name + i); i++)
+		{
+			const char c = static_cast<char>(*vm::get_super_ptr<u8>(name + i));
+
+			if (c == '\0')
+			{
+				break;
+			}
+
+			out += c;
+		}
+
+		// Drop the length prefix of a plain class name
+		usz digits = 0;
+
+		while (digits < out.size() && out[digits] >= '0' && out[digits] <= '9')
+		{
+			digits++;
+		}
+
+		return out.empty() ? fmt::format("?%08x", vtable) : (out[0] == 'N' ? out : out.substr(digits));
+	}
+
+	void t5dr_task_diag(u32 root)
+	{
+		static const bool log = get_env("RB_T5_TASKLOG") == "1";
+		static const std::string sync_task = get_env("RB_T5_SYNC_TASK");
+
+		// Determinism check: fingerprint of the random generators every 300 game frames of the fight (compare the
+		// record and replay logs line by line: same frame, same value)
+		if (g_state.synced && g_state.seq[0] >= g_sync_frame && (g_state.seq[0] - g_sync_frame) % 300 == 0)
+		{
+			static u64 last = umax;
+
+			if (last != g_state.seq[0])
+			{
+				last = g_state.seq[0];
+				rb_log.notice("T5DR fight frame %u: rng 0x%08x", g_state.seq[0] - g_sync_frame, t5dr::rng_fingerprint());
+
+				if (static const bool rng_log = get_env("RB_T5_RNGLOG") == "1"; rng_log)
+				{
+					rb_log.notice("T5DR random draws before fight frame %u (r=rand A=add M=mul, call site:count):%s", g_state.seq[0] - g_sync_frame, rng_calls_text());
+				}
+			}
+		}
+
+		if (!log && (sync_task.empty() || g_state.synced))
+		{
+			return;
+		}
+
+		std::vector<u32> vtables;
+		u32 node = vm::check_addr<0x14>(root) ? static_cast<u32>(vm::read32(root + 0x10)) : 0u;
+
+		for (u32 n = 0; node && node != root && n < 1024 && vm::check_addr<0x50>(node); n++)
+		{
+			vtables.push_back(vm::read32(node));
+			node = vm::read32(node + 0x10);
+		}
+
+		static std::vector<u32> last;
+
+		if (log && vtables != last)
+		{
+			std::string list;
+
+			for (const u32 vt : vtables)
+			{
+				list += fmt::format("%s%s(0x%08x)", list.empty() ? "" : ", ", t5dr_class_name(vt), vt);
+			}
+
+			rb_log.notice("T5DR tasks at game frame %u (%u): %s", g_state.seq[0], vtables.size(), list);
+		}
+
+		if (!sync_task.empty() && !g_state.synced && vtables != last)
+		{
+			for (const u32 vt : vtables)
+			{
+				if (t5dr_class_name(vt).find(sync_task) != umax)
+				{
+					// Same as an RB_SYNC_ADDR sync point: recorded as a marker in record mode, realigns the replay
+					// Taken by the next per-frame key read (rb_t5_keys, inside this frame's task walk)
+					rb_log.success("T5DR sync point: task %s (0x%08x) appeared at game frame %u", t5dr_class_name(vt), vt, g_state.seq[0]);
+					ensure_init();
+					g_t5dr_sync_pending = true;
+					break;
+				}
+			}
+		}
+
+		last = std::move(vtables);
+	}
+
 	void run_task_walk(ppu_thread& ppu, u32 root)
 	{
+		if (g_t5dr)
+		{
+			t5dr::run_task_walk(ppu, root);
+			return;
+		}
+
 		// Own stack frame for the calls (FUN_000ff344 saves its LR into the caller frame)
 		const u64 old_r1 = ppu.gpr[1];
 		ppu.gpr[1] = (old_r1 - 0x100) & ~0xfull;
@@ -2657,11 +2896,665 @@ namespace rb
 #endif
 	}
 
+	// ---------- Tekken 5 DR practice tools (RB_T5_PRACTICE=1, started by the launcher's Practice) ----------
+	// Hold Select on player 1's controller (Select is swallowed in the fight, nothing reaches the game while it is held):
+	//   Select + Square    save position (snapshot of the whole fight state, rb_state netplay ring)
+	//   Select + Cross     reset to the saved position; a recorded dummy action starts playing from there
+	//   Select + Triangle  record the dummy: your controller plays player 2 until you press it again
+	//   Select + Circle    play the recording now / stop it
+	//   Select + R1        loop the playback on / off
+	//   Select + L2        frame data display on / off
+	//   Select + L1        capture 240 frames of fight data for the developer (dump files + log lines)
+	// Frame data: when a player loses health, the frames since the other player's last attack button press (startup)
+	// and the damage, with combo totals. Frame advantage needs the hit/block stun counters, still to be found.
+	// The game's key word (FUN_0008fa78): (digital1 << 8) | digital2 of the PS3 pad.
+	namespace t5p
+	{
+		constexpr u16 k_select = 0x0100, k_l2 = 0x01, k_r2 = 0x02, k_l1 = 0x04, k_r1 = 0x08, k_triangle = 0x10, k_circle = 0x20,
+			k_cross = 0x40, k_square = 0x80, k_attack = 0xff;
+		constexpr usz max_record = 60 * 20; // 20 seconds
+
+		bool enabled()
+		{
+			static const bool on = get_env("RB_T5_PRACTICE") == "1";
+			return on;
+		}
+
+		enum class dummy_t { idle, recording, playing };
+
+		struct state_t
+		{
+			u64 frame = 0;           // own counter, +1 per main loop iteration (not rewound by a reset)
+			u64 stepped = umax;      // frame whose keys were already decided
+			u16 p1_prev = 0;         // raw keys of player 1 in the previous frame
+			u16 out[2]{};            // keys given to the game this frame
+			bool override_p2 = false;
+			dummy_t dummy = dummy_t::idle;
+			std::vector<u16> rec;
+			usz play_pos = 0;
+			bool loop = false;
+			bool req_save = false, req_load = false, waiting_sync = false;
+			bool have_pos = false;
+			u64 pos_frame = 0;
+			bool show_frames = true;
+			u64 press[2]{umax, umax}; // frame of each player's last attack button press
+			u16 health[2]{};
+			u64 combo_last[2]{};      // frame of the last hit on each player
+			u32 combo_hits[2]{}, combo_damage[2]{};
+			u32 capture_left = 0;
+			bool greeted = false;
+		} g_p;
+
+		void show(const std::string& text, u64 seconds = 3)
+		{
+			rb_log.notice("Practice: %s", text);
+			rsx::overlays::queue_message(text, seconds * 1'000'000, {}, rsx::overlays::message_pin_location::top_right);
+		}
+
+		u16 ring_keys(u32 player)
+		{
+			const u32 index = vm::read32(vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_key_index)));
+			const u32 ring = vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_key_ring));
+			return vm::read16(ring + (((player & 1) * 16 + ((index - 1) & 15)) * 2));
+		}
+
+		void note_press(int player, u16 prev, u16 now)
+		{
+			if ((now & ~prev) & k_attack)
+			{
+				g_p.press[player] = g_p.frame;
+			}
+		}
+
+		// Decides both players' keys of this frame (once, at the first key read of the frame)
+		void step()
+		{
+			if (g_p.stepped == g_p.frame)
+			{
+				return;
+			}
+
+			g_p.stepped = g_p.frame;
+			const u16 raw = ring_keys(0);
+			const u16 pressed = static_cast<u16>(raw & ~g_p.p1_prev);
+			const u16 prev_out[2] = {g_p.out[0], g_p.out[1]};
+			g_p.p1_prev = raw;
+
+			if (!g_p.greeted)
+			{
+				g_p.greeted = true;
+				show("Practice tools: hold SELECT and press  Square save position   Cross reset   Triangle record dummy   Circle play dummy", 12);
+				show("SELECT + R1 loop playback   L2 frame data on/off   (set the dummy to 2P / controller in the practice menu)", 12);
+			}
+
+			if (raw & k_select)
+			{
+				if (pressed & k_square)
+				{
+					g_p.req_save = true;
+				}
+
+				if (pressed & k_cross)
+				{
+					if (g_p.have_pos) g_p.req_load = true;
+					else show("No saved position yet: SELECT + Square saves one");
+				}
+
+				if (pressed & k_triangle)
+				{
+					if (g_p.dummy == dummy_t::recording)
+					{
+						while (!g_p.rec.empty() && g_p.rec.back() == 0) g_p.rec.pop_back();
+						g_p.dummy = dummy_t::idle;
+						show(fmt::format("Recording stopped: %.1f seconds. SELECT + Circle plays it, SELECT + Cross resets and plays it", g_p.rec.size() / 60.0));
+					}
+					else
+					{
+						g_p.rec.clear();
+						g_p.dummy = dummy_t::recording;
+						show("Recording: your controller plays the dummy now. SELECT + Triangle stops");
+					}
+				}
+
+				if (pressed & k_circle)
+				{
+					if (g_p.dummy == dummy_t::playing)
+					{
+						g_p.dummy = dummy_t::idle;
+						show("Playback stopped");
+					}
+					else if (!g_p.rec.empty())
+					{
+						g_p.dummy = dummy_t::playing;
+						g_p.play_pos = 0;
+						show("Playing the recording");
+					}
+					else
+					{
+						show("Nothing recorded yet: SELECT + Triangle records the dummy");
+					}
+				}
+
+				if (pressed & k_r1)
+				{
+					g_p.loop = !g_p.loop;
+					show(g_p.loop ? "Playback loops" : "Playback plays once");
+				}
+
+				if (pressed & k_l2)
+				{
+					g_p.show_frames = !g_p.show_frames;
+					show(g_p.show_frames ? "Frame data on" : "Frame data off");
+				}
+
+				if (pressed & k_l1)
+				{
+					g_p.capture_left = 240;
+					show("Capturing 240 frames of fight data");
+				}
+			}
+
+			// Player 1: nothing reaches the game while SELECT is held or while the controller plays the dummy
+			const u16 p1 = (raw & k_select) ? u16{0} : raw;
+			g_p.out[0] = g_p.dummy == dummy_t::recording ? u16{0} : p1;
+			g_p.override_p2 = false;
+
+			if (g_p.dummy == dummy_t::recording)
+			{
+				g_p.out[1] = p1;
+				g_p.override_p2 = true;
+
+				if (g_p.rec.size() < max_record)
+				{
+					g_p.rec.push_back(p1);
+				}
+				else
+				{
+					g_p.dummy = dummy_t::idle;
+					show("Recording full (20 seconds)");
+				}
+			}
+			else if (g_p.dummy == dummy_t::playing)
+			{
+				if (g_p.play_pos >= g_p.rec.size())
+				{
+					g_p.play_pos = 0;
+
+					if (!g_p.loop)
+					{
+						g_p.dummy = dummy_t::idle;
+					}
+				}
+
+				if (g_p.dummy == dummy_t::playing)
+				{
+					g_p.out[1] = g_p.rec[g_p.play_pos++];
+					g_p.override_p2 = true;
+				}
+			}
+
+			note_press(0, prev_out[0], g_p.out[0]);
+
+			if (g_p.override_p2)
+			{
+				note_press(1, prev_out[1], g_p.out[1]);
+			}
+		}
+
+		u16 on_keys(u32 player, u16 keys)
+		{
+			step();
+
+			if (player == 0)
+			{
+				return g_p.out[0];
+			}
+
+			if (g_p.override_p2)
+			{
+				return g_p.out[1];
+			}
+
+			// The real player 2 (another controller or the CPU's own input): its presses count for the frame data too
+			note_press(1, g_p.out[1], keys);
+			g_p.out[1] = keys;
+			return keys;
+		}
+
+		void frame_data()
+		{
+			// Only while a round runs: its frame counter (rb_t5dr.h) advances; menus and loading leave old values there
+			static u32 last_round_frame = 0;
+			const u32 round_frame = vm::check_addr<4>(t5dr::fight_round_frame) ? +vm::read32(t5dr::fight_round_frame) : 0;
+			const bool active = round_frame != last_round_frame;
+			last_round_frame = round_frame;
+
+			if (!active)
+			{
+				g_p.health[0] = g_p.health[1] = 0;
+				return;
+			}
+
+			for (int victim = 0; victim < 2; victim++)
+			{
+				const u16 hp = static_cast<u16>(t5dr::fight_health_of(victim));
+				const u16 before = g_p.health[victim];
+				g_p.health[victim] = hp;
+
+				if (!before || hp >= before || before - hp > 145)
+				{
+					continue;
+				}
+
+				const int attacker = victim ^ 1;
+				const u32 damage = static_cast<u32>(before - hp);
+
+				if (g_p.frame - g_p.combo_last[victim] > 90)
+				{
+					g_p.combo_hits[victim] = 0;
+					g_p.combo_damage[victim] = 0;
+				}
+
+				g_p.combo_last[victim] = g_p.frame;
+				g_p.combo_hits[victim]++;
+				g_p.combo_damage[victim] += damage;
+
+				if (!g_p.show_frames)
+				{
+					continue;
+				}
+
+				std::string text = fmt::format("P%d hit: %u damage", attacker + 1, damage);
+
+				if (g_p.press[attacker] != umax && g_p.frame - g_p.press[attacker] <= 120)
+				{
+					fmt::append(text, ", startup i%u", g_p.frame - g_p.press[attacker]);
+				}
+
+				if (g_p.combo_hits[victim] > 1)
+				{
+					fmt::append(text, "   combo %u hits, %u damage", g_p.combo_hits[victim], g_p.combo_damage[victim]);
+				}
+
+				show(text, 4);
+			}
+		}
+
+		// Main loop frame boundary, before the task walk
+		void boundary()
+		{
+			g_p.frame++;
+			frame_data();
+
+			if (g_p.capture_left)
+			{
+				g_p.capture_left--;
+				dump_memory_now("practice", g_p.frame);
+				rb_log.notice("Practice capture frame %u: keys %04x %04x, health %u %u, last press %d %d", g_p.frame, g_p.out[0], g_p.out[1],
+					t5dr::fight_health_of(0), t5dr::fight_health_of(1), g_p.press[0] == umax ? -1 : static_cast<int>(g_p.frame - g_p.press[0]),
+					g_p.press[1] == umax ? -1 : static_cast<int>(g_p.frame - g_p.press[1]));
+
+				if (!g_p.capture_left)
+				{
+					show("Capture done: send the practice_*.bin files and RPCS3.log");
+				}
+			}
+
+			if (g_p.req_save)
+			{
+				if (!state_net_ready())
+				{
+					if (g_sync_frame == umax)
+					{
+						force_sync_point("practice");
+					}
+
+					if (!g_p.waiting_sync)
+					{
+						g_p.waiting_sync = true;
+						show("Getting position saving ready, a few seconds...");
+					}
+
+					return; // retried every frame until the first snapshot exists
+				}
+
+				g_p.req_save = false;
+				g_p.waiting_sync = false;
+				state_net_save(g_state.seq[0], g_state.seq);
+				g_p.have_pos = true;
+				g_p.pos_frame = g_state.seq[0];
+				show("Position saved. SELECT + Cross resets to it");
+			}
+
+			if (g_p.req_load)
+			{
+				g_p.req_load = false;
+				snapshot_info info{};
+
+				if (state_net_load(g_p.pos_frame, info))
+				{
+					set_seq(info.seq);
+					g_p.health[0] = g_p.health[1] = 0;
+					g_p.press[0] = g_p.press[1] = umax;
+
+					if (!g_p.rec.empty() && g_p.dummy != dummy_t::recording)
+					{
+						g_p.dummy = dummy_t::playing;
+						g_p.play_pos = 0;
+					}
+				}
+				else
+				{
+					g_p.have_pos = false;
+					show("The saved position is gone (the game reloaded something): save a new one");
+				}
+			}
+		}
+	}
+
+	// Tekken 5 DR (NPEA00019): only the frame hook. The rollback then runs through the netplay path (RB_NET=1,
+	// GGPO over direct UDP, both players' pads on ports 0 and 1 of an offline versus match); the Tekken 6 online
+	// module (rb_online) and the Tekken 6 specific render hooks are not used.
+	// Tekken 5 DR: replacement of FUN_00122360(player), the game's once-per-frame read of the newest keyread sample.
+	// The u16 it returns is carried in a CellPadData (digital1 = high byte, digital2 = low byte) through the normal
+	// pipeline (sync point, record / replay, GGPO), so the read counter is the game frame and every frame of a
+	// recording or of the opponent lands on the same game frame in every run.
+	u32 rb_t5_keys(ppu_thread& ppu, u32 player)
+	{
+		const u32 mode = vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_key_mode));
+
+		if (vm::read32(mode) == 4 && vm::read32(mode + 16) == 17)
+		{
+			const u64 old_r1 = ppu.gpr[1];
+			ppu.gpr[1] = (old_r1 - 0x100) & ~0xfull;
+			vm::write32(static_cast<u32>(ppu.gpr[1]), static_cast<u32>(old_r1));
+			ppu.fast_call(t5dr::key_special, t5dr::toc);
+			ppu.gpr[1] = old_r1;
+		}
+
+		// The original takes the ring lwmutex for this one halfword read; the store is a single halfword too
+		const u32 index = vm::read32(vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_key_index)));
+		const u32 ring = vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_key_ring));
+		u16 keys = vm::read16(ring + (((player & 1) * 16 + ((index - 1) & 15)) * 2));
+
+		// RB_T5_KEYLOG=1 (menu scripting): every change of a player's game button word, with the game frame
+		if (static const bool keylog = get_env("RB_T5_KEYLOG") == "1"; keylog && player < 2)
+		{
+			static u16 last[2]{};
+			static u32 frames[2]{};
+
+			if (keys != last[player])
+			{
+				rb_log.notice("T5DR keys p%u: 0x%04x (was 0x%04x for %u frames) at game frame %u", player + 1, keys, last[player], frames[player], g_state.seq[0]);
+				last[player] = keys;
+				frames[player] = 0;
+			}
+
+			frames[player]++;
+		}
+
+		if (player == 0 && g_state.synced)
+		{
+			state_sample_fifo();
+		}
+
+		if (player < max_ports)
+		{
+			CellPadData pad{};
+			pad.len = 24;
+			pad.button[CELL_PAD_BTN_OFFSET_DIGITAL1] = keys >> 8;
+			pad.button[CELL_PAD_BTN_OFFSET_DIGITAL2] = keys & 0xff;
+			on_pad_get_data_impl(player, &pad);
+
+			if (pad.len > 0)
+			{
+				keys = static_cast<u16>(((pad.button[CELL_PAD_BTN_OFFSET_DIGITAL1] & 0xff) << 8) | (pad.button[CELL_PAD_BTN_OFFSET_DIGITAL2] & 0xff));
+			}
+		}
+
+		if (t5p::enabled() && player < 2)
+		{
+			keys = t5p::on_keys(player, keys);
+		}
+
+		return keys;
+	}
+
+	const u32 s_t5_keys_index = REG_HIDDEN_FUNC(rb_t5_keys);
+
+	u64 g_t5_flips_skipped = 0;
+
+	void t5_call(ppu_thread& ppu, u32 addr)
+	{
+		const u64 old_r1 = ppu.gpr[1];
+		ppu.gpr[1] = (old_r1 - 0x100) & ~0xfull;
+		vm::write32(static_cast<u32>(ppu.gpr[1]), static_cast<u32>(old_r1));
+		ppu.fast_call(addr, t5dr::toc);
+		ppu.gpr[1] = old_r1;
+	}
+
+	// Replacement of the frame end FUN_00323d24 (RB_T5_FAST_RESIM, default on): a re-simulated frame is not flipped and
+	// does not wait for the flip / vblank, so a rollback's re-simulated frames run at CPU speed (stress test 2026-10-19:
+	// 7 re-simulated frames took ~160 ms, each one waiting for a vblank). Its draw data is simply replaced by the next
+	// live frame's. The frame bookkeeping before and after the flip still runs.
+	void rb_t5_frame_end(ppu_thread& ppu)
+	{
+		t5_call(ppu, t5dr::frame_end_pre);
+
+		if (g_t5_last_walk_resim)
+		{
+			g_t5_flips_skipped++;
+		}
+		else
+		{
+			t5_call(ppu, t5dr::frame_end_flip);
+		}
+
+		ppu.gpr[3] = vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_frame_end_post_arg));
+		t5_call(ppu, t5dr::frame_end_post);
+	}
+
+	const u32 s_t5_frame_end_index = REG_HIDDEN_FUNC(rb_t5_frame_end);
+
+	// Netplay re-simulation (rb_net.cpp cb_advance_frame): everything the main loop runs between two task walks, so a
+	// re-simulated frame is a whole main loop iteration like the frames of the stress test (end of the frame, flip,
+	// start of the next frame). Only re-running the task walk (the Tekken 6 way) left the graphics library without its
+	// per-frame work: the RSX semaphore timed out and its memory grew by gigabytes (two-instance test 2026-10-19).
+	// The flip does not wait for a vblank: one is posted right away (RSXThread.cpp), the frame limiter is lifted.
+	void t5dr_between_walks(ppu_thread& ppu)
+	{
+		using namespace t5dr;
+		const auto toc32 = [](s32 off) { return static_cast<u32>(toc + off); };
+
+		for (const u32 f : loop_tail)
+		{
+			t5_call(ppu, f);
+		}
+
+		const s32 counter = static_cast<s32>(vm::read32(vm::read32(toc32(toc_loop_counter_src))));
+		vm::write32(vm::read32(toc32(toc_loop_counter_dst)) + 96, static_cast<u32>(counter / 96));
+
+		const u32 obj = vm::read32(toc32(toc_loop_obj));
+		ppu.gpr[3] = obj;
+		ppu.gpr[4] = 0;
+		t5_call(ppu, loop_head_select);
+		t5_call(ppu, loop_head_pre);
+
+		const bool limit_was_off = g_disable_frame_limit;
+		g_disable_frame_limit = true;
+		g_rb_vblank_fast_poll = true;
+		g_rb_vblank_kick = 1;
+		t5_call(ppu, frame_end);
+		g_disable_frame_limit = limit_was_off;
+
+		ppu.gpr[3] = obj;
+		ppu.gpr[4] = 0;
+		t5_call(ppu, loop_head_select);
+
+		for (const u32 f : loop_head_post)
+		{
+			t5_call(ppu, f);
+		}
+	}
+
+	// RB_T5_RNGLOG=1 (diagnostics): the game's random generators are replaced by exact C++ copies that count their callers
+	// (call site = LR); every 300 fight frames the log lists the callers and how often they drew. Two runs that should be
+	// identical (clean replay vs. rewind / stress test) show which caller draws differently first.
+	std::map<u32, u32> g_rng_calls;
+	std::mutex g_rng_mutex;
+
+	void rng_note(u32 lr, u32 kind)
+	{
+		std::lock_guard lock(g_rng_mutex);
+		g_rng_calls[(kind << 28) | (lr & 0x0fffffff)]++;
+	}
+
+	std::string rng_calls_text()
+	{
+		std::lock_guard lock(g_rng_mutex);
+		std::string out;
+
+		for (const auto& [key, n] : g_rng_calls)
+		{
+			fmt::append(out, " %c%x:%u", "rAM"[std::min<u32>(key >> 28, 2)], key & 0x0fffffff, n);
+		}
+
+		g_rng_calls.clear();
+		return out;
+	}
+
+	u32 rb_t5_rand(ppu_thread& ppu)
+	{
+		rng_note(static_cast<u32>(ppu.lr), 0);
+		const u32 x = vm::read32(t5dr::rng_rand_state) * 0x6c078965u + 12345u;
+		vm::write32(t5dr::rng_rand_state, x);
+		return x & 0x7fffffffu;
+	}
+
+	u32 t5_lf_step(u32 index_addr, u32 table, bool multiply)
+	{
+		const u32 idx = vm::read32(index_addr);
+		const u32 a = vm::read32(table + (((idx - 28) << 2) & 0x7c));
+		const u32 b = vm::read32(table + (((idx - 3) << 2) & 0x7c));
+		const u32 v = multiply ? a * b : a + b;
+		vm::write32(index_addr, (idx + 1) & 31);
+		vm::write32(table + (idx << 2), v);
+		return v & 0x7fffffffu;
+	}
+
+	s32 t5_lf_range(u32 r, s32 lo, s32 hi)
+	{
+		const s32 n = hi - lo + 1;
+		const s32 q = n ? static_cast<s32>(r) / n : 0;
+		return static_cast<s32>(r) - q * n + lo;
+	}
+
+	s32 rb_t5_random_add(ppu_thread& ppu, s32 lo, s32 hi)
+	{
+		rng_note(static_cast<u32>(ppu.lr), 1);
+		return t5_lf_range(t5_lf_step(t5dr::rng_lf1_index, t5dr::rng_lf1_table, false), lo, hi);
+	}
+
+	s32 rb_t5_random_mul(ppu_thread& ppu, s32 lo, s32 hi)
+	{
+		rng_note(static_cast<u32>(ppu.lr), 2);
+		return t5_lf_range(t5_lf_step(t5dr::rng_lf2_index, t5dr::rng_lf2_table, true), lo, hi);
+	}
+
+	const u32 s_t5_rand_index = REG_HIDDEN_FUNC(rb_t5_rand);
+	const u32 s_t5_random_add_index = REG_HIDDEN_FUNC(rb_t5_random_add);
+	const u32 s_t5_random_mul_index = REG_HIDDEN_FUNC(rb_t5_random_mul);
+
+	void install_t5dr_hooks(std::vector<u32>& applied)
+	{
+		for (const t5dr::code_word& w : t5dr::code_signature)
+		{
+			if (!vm::check_addr<4>(w.addr) || vm::read32(w.addr) != w.word)
+			{
+				rb_log.error("Tekken 5 DR: code at 0x%08x is 0x%08x, expected 0x%08x (different build or region?) - no rollback hooks",
+					w.addr, vm::check_addr<4>(w.addr) ? +vm::read32(w.addr) : 0u, w.word);
+				return;
+			}
+		}
+
+		const u32 target = g_fxo->get<ppu_function_manager>().func_addr(s_frame_step_index, true);
+
+		if (target && ppu_form_branch_to_code(t5dr::task_walk, target))
+		{
+			applied.push_back(t5dr::task_walk);
+			g_frame_hook_installed = true;
+			g_t5dr = true;
+			rb_log.success("Tekken 5 DR frame hook: 0x%08x (task walk of the main loop) -> HLE 0x%08x", t5dr::task_walk, target);
+
+			const u32 keys_target = g_fxo->get<ppu_function_manager>().func_addr(s_t5_keys_index, true);
+
+			if (keys_target && ppu_form_branch_to_code(t5dr::key_latest, keys_target))
+			{
+				applied.push_back(t5dr::key_latest);
+				rb_log.success("Tekken 5 DR input hook: 0x%08x (newest key sample per frame) -> HLE 0x%08x", t5dr::key_latest, keys_target);
+			}
+
+			// RB_T5_FAST_RESIM=1: re-simulated frames skip the flip entirely. Crashed at the first rollback of the stress test
+			// (2026-10-19: a null callback in the graphics library, 0x00388444, whose per-frame queues are run by the flip),
+			// so off by default; the default lifts the frame limiter for re-simulated frames instead (see rb_frame_step)
+			if (get_env("RB_T5_FAST_RESIM") == "1")
+			{
+				const u32 end_target = g_fxo->get<ppu_function_manager>().func_addr(s_t5_frame_end_index, true);
+
+				if (end_target && ppu_form_branch_to_code(t5dr::frame_end, end_target))
+				{
+					applied.push_back(t5dr::frame_end);
+					rb_log.success("Tekken 5 DR frame end: 0x%08x -> HLE 0x%08x (re-simulated frames are not flipped)", t5dr::frame_end, end_target);
+				}
+			}
+
+			if (get_env("RB_T5_RNGLOG") == "1")
+			{
+				const std::pair<u32, u32> rng_hooks[] =
+				{
+					{0x00370fe4, s_t5_rand_index},       // rand()
+					{0x00163d6c, s_t5_random_add_index}, // random(lo, hi), additive generator
+					{0x00163e04, s_t5_random_mul_index}, // random(lo, hi), multiplicative generator
+				};
+
+				for (const auto& [addr, index] : rng_hooks)
+				{
+					const u32 hle = g_fxo->get<ppu_function_manager>().func_addr(index, true);
+
+					if (hle && ppu_form_branch_to_code(addr, hle))
+					{
+						applied.push_back(addr);
+						rb_log.success("Tekken 5 DR random generator 0x%08x -> HLE 0x%08x (caller log)", addr, hle);
+					}
+				}
+			}
+			else
+			{
+				rb_log.error("Tekken 5 DR input hook could not be installed (target 0x%08x): inputs are not frame-exact", keys_target);
+			}
+		}
+		else
+		{
+			rb_log.error("Tekken 5 DR frame hook could not be installed (target 0x%08x)", target);
+		}
+	}
+
 	void install_static_hooks(std::vector<u32>& applied)
 	{
 		const char* v = std::getenv("RB_FRAME_HOOK");
 
-		if ((v && *v == '0') || Emu.GetTitleID() != "BLUS30359")
+		if (v && *v == '0')
+		{
+			return;
+		}
+
+		if (t5dr::is_title(Emu.GetTitleID()))
+		{
+			install_t5dr_hooks(applied);
+			return;
+		}
+
+		if (Emu.GetTitleID() != "BLUS30359")
 		{
 			return;
 		}
@@ -2970,8 +3863,30 @@ namespace rb
 		}
 	}
 
+	// T5DR: checksums / dumps / trace windows at the frame boundary (main thread, after a possible restore, before the
+	// task walk): the state at the end of game frame seq - 1, the same point in every pass
+	void t5dr_frame_checks()
+	{
+		static u64 last = umax;
+
+		if (g_state.seq[0] && g_state.seq[0] != last)
+		{
+			last = g_state.seq[0];
+			g_game_frame = g_state.seq[0];
+			trace_window(g_state.seq[0] - 1);
+			checksum_on_frame(g_state.seq[0] - 1);
+		}
+	}
+
 	void after_pad_get_data(u32 port_no)
 	{
+		// Tekken 5 DR: the pads are read on the keyread thread, at any point of the main thread's frame; hashes and dumps are
+		// taken at the frame boundary on the main thread instead (t5dr_frame_checks)
+		if (g_t5dr)
+		{
+			return;
+		}
+
 		// The first pad read of a game frame is the frame boundary
 		static u64 last_reads = 0;
 
