@@ -138,3 +138,17 @@ for the environment variables. Your ladder program starts RPCS3 with them:
 | online versus mode | `tcb_gm_netvs_t`, vtable `0x10083928` |
 | game UDP send / receive | `0x00234b20` (sendto) / `0x00234d48` (recvfrom) |
 | imports | sys_io (pad), cellGcmSys, sys_net, sceNp (matching, signaling), cellSpurs, cellAudio, cellAtrac |
+
+## Practice tools (RB_T5_PRACTICE=1, `practice_t5dr.bat`, the launcher's Practice)
+
+Hold SELECT on player 1's controller (swallowed in the fight) and press: Square = save position (snapshot through the
+netplay ring, `RB_SNAP_RING=1`; before the first snapshot exists the sync point is forced and saving waits ~2 s),
+Cross = reset to it (a recorded dummy action then plays from the start), Triangle = record the dummy (player 1's
+controller plays player 2, up to 20 s), Circle = play / stop, R1 = loop, L2 = frame data on/off, L1 = capture 240 frames
+(dumps of 0x10090000-0x100a0000 per frame + a log line with keys, health and frames since the last presses).
+The dummy must be set to player 2 control in the game's practice menu. Messages appear top right (RPCS3 native overlay).
+Frame data so far: on every health drop, damage, frames since the attacker's last attack button press ("startup",
+to be calibrated against known moves, e.g. a jab = i10) and combo totals. Frame advantage needs the hit/block stun
+counters of the player structs: find them in a capture (block a jab, get hit by a jab, whiff).
+Key word of FUN_00122360 = (digital1 << 8) | digital2 (FUN_0008fa78): SELECT 0x0100, START 0x0800, up/right/down/left
+0x1000/0x2000/0x4000/0x8000, L2 0x01, R2 0x02, L1 0x04, R1 0x08, triangle 0x10, circle 0x20, cross 0x40, square 0x80.

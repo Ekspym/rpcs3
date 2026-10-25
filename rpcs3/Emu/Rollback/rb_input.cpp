@@ -10,6 +10,7 @@
 #include "Emu/Cell/PPUModule.h"
 #include "Emu/System.h"
 #include "Emu/RSX/RSXThread.h"
+#include "Emu/RSX/Overlays/overlay_message.h"
 #include "Emu/system_config.h"
 #include "Emu/IdManager.h"
 #include "Emu/Io/pad_types.h"
@@ -43,6 +44,12 @@ namespace rb
 {
 	bool g_t5dr = false; // Tekken 5 DR (rb_t5dr.h): frame hook installed on its task walk
 	bool g_t5_last_walk_resim = false; // T5DR: the previous main loop iteration's task walk was a re-simulated frame
+
+	namespace t5p
+	{
+		bool enabled();
+		void boundary();
+	}
 
 	namespace
 	{
@@ -2273,6 +2280,12 @@ namespace rb
 			}
 		}
 
+		// T5DR practice tools: position save / reset, frame data (before the task walk, like the netplay snapshots)
+		if (g_t5dr && t5p::enabled())
+		{
+			t5p::boundary();
+		}
+
 		// Netplay runs the frame itself (GGPO input exchange, rollbacks with re-simulated frames)
 		if (!net::run_frame(ppu, root, g_state.seq[0]))
 		{
@@ -2883,6 +2896,362 @@ namespace rb
 #endif
 	}
 
+	// ---------- Tekken 5 DR practice tools (RB_T5_PRACTICE=1, started by the launcher's Practice) ----------
+	// Hold Select on player 1's controller (Select is swallowed in the fight, nothing reaches the game while it is held):
+	//   Select + Square    save position (snapshot of the whole fight state, rb_state netplay ring)
+	//   Select + Cross     reset to the saved position; a recorded dummy action starts playing from there
+	//   Select + Triangle  record the dummy: your controller plays player 2 until you press it again
+	//   Select + Circle    play the recording now / stop it
+	//   Select + R1        loop the playback on / off
+	//   Select + L2        frame data display on / off
+	//   Select + L1        capture 240 frames of fight data for the developer (dump files + log lines)
+	// Frame data: when a player loses health, the frames since the other player's last attack button press (startup)
+	// and the damage, with combo totals. Frame advantage needs the hit/block stun counters, still to be found.
+	// The game's key word (FUN_0008fa78): (digital1 << 8) | digital2 of the PS3 pad.
+	namespace t5p
+	{
+		constexpr u16 k_select = 0x0100, k_l2 = 0x01, k_r2 = 0x02, k_l1 = 0x04, k_r1 = 0x08, k_triangle = 0x10, k_circle = 0x20,
+			k_cross = 0x40, k_square = 0x80, k_attack = 0xff;
+		constexpr usz max_record = 60 * 20; // 20 seconds
+
+		bool enabled()
+		{
+			static const bool on = get_env("RB_T5_PRACTICE") == "1";
+			return on;
+		}
+
+		enum class dummy_t { idle, recording, playing };
+
+		struct state_t
+		{
+			u64 frame = 0;           // own counter, +1 per main loop iteration (not rewound by a reset)
+			u64 stepped = umax;      // frame whose keys were already decided
+			u16 p1_prev = 0;         // raw keys of player 1 in the previous frame
+			u16 out[2]{};            // keys given to the game this frame
+			bool override_p2 = false;
+			dummy_t dummy = dummy_t::idle;
+			std::vector<u16> rec;
+			usz play_pos = 0;
+			bool loop = false;
+			bool req_save = false, req_load = false, waiting_sync = false;
+			bool have_pos = false;
+			u64 pos_frame = 0;
+			bool show_frames = true;
+			u64 press[2]{umax, umax}; // frame of each player's last attack button press
+			u16 health[2]{};
+			u64 combo_last[2]{};      // frame of the last hit on each player
+			u32 combo_hits[2]{}, combo_damage[2]{};
+			u32 capture_left = 0;
+			bool greeted = false;
+		} g_p;
+
+		void show(const std::string& text, u64 seconds = 3)
+		{
+			rb_log.notice("Practice: %s", text);
+			rsx::overlays::queue_message(text, seconds * 1'000'000, {}, rsx::overlays::message_pin_location::top_right);
+		}
+
+		u16 ring_keys(u32 player)
+		{
+			const u32 index = vm::read32(vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_key_index)));
+			const u32 ring = vm::read32(static_cast<u32>(t5dr::toc + t5dr::toc_key_ring));
+			return vm::read16(ring + (((player & 1) * 16 + ((index - 1) & 15)) * 2));
+		}
+
+		void note_press(int player, u16 prev, u16 now)
+		{
+			if ((now & ~prev) & k_attack)
+			{
+				g_p.press[player] = g_p.frame;
+			}
+		}
+
+		// Decides both players' keys of this frame (once, at the first key read of the frame)
+		void step()
+		{
+			if (g_p.stepped == g_p.frame)
+			{
+				return;
+			}
+
+			g_p.stepped = g_p.frame;
+			const u16 raw = ring_keys(0);
+			const u16 pressed = static_cast<u16>(raw & ~g_p.p1_prev);
+			const u16 prev_out[2] = {g_p.out[0], g_p.out[1]};
+			g_p.p1_prev = raw;
+
+			if (!g_p.greeted)
+			{
+				g_p.greeted = true;
+				show("Practice tools: hold SELECT and press  Square save position   Cross reset   Triangle record dummy   Circle play dummy", 12);
+				show("SELECT + R1 loop playback   L2 frame data on/off   (set the dummy to 2P / controller in the practice menu)", 12);
+			}
+
+			if (raw & k_select)
+			{
+				if (pressed & k_square)
+				{
+					g_p.req_save = true;
+				}
+
+				if (pressed & k_cross)
+				{
+					if (g_p.have_pos) g_p.req_load = true;
+					else show("No saved position yet: SELECT + Square saves one");
+				}
+
+				if (pressed & k_triangle)
+				{
+					if (g_p.dummy == dummy_t::recording)
+					{
+						while (!g_p.rec.empty() && g_p.rec.back() == 0) g_p.rec.pop_back();
+						g_p.dummy = dummy_t::idle;
+						show(fmt::format("Recording stopped: %.1f seconds. SELECT + Circle plays it, SELECT + Cross resets and plays it", g_p.rec.size() / 60.0));
+					}
+					else
+					{
+						g_p.rec.clear();
+						g_p.dummy = dummy_t::recording;
+						show("Recording: your controller plays the dummy now. SELECT + Triangle stops");
+					}
+				}
+
+				if (pressed & k_circle)
+				{
+					if (g_p.dummy == dummy_t::playing)
+					{
+						g_p.dummy = dummy_t::idle;
+						show("Playback stopped");
+					}
+					else if (!g_p.rec.empty())
+					{
+						g_p.dummy = dummy_t::playing;
+						g_p.play_pos = 0;
+						show("Playing the recording");
+					}
+					else
+					{
+						show("Nothing recorded yet: SELECT + Triangle records the dummy");
+					}
+				}
+
+				if (pressed & k_r1)
+				{
+					g_p.loop = !g_p.loop;
+					show(g_p.loop ? "Playback loops" : "Playback plays once");
+				}
+
+				if (pressed & k_l2)
+				{
+					g_p.show_frames = !g_p.show_frames;
+					show(g_p.show_frames ? "Frame data on" : "Frame data off");
+				}
+
+				if (pressed & k_l1)
+				{
+					g_p.capture_left = 240;
+					show("Capturing 240 frames of fight data");
+				}
+			}
+
+			// Player 1: nothing reaches the game while SELECT is held or while the controller plays the dummy
+			const u16 p1 = (raw & k_select) ? u16{0} : raw;
+			g_p.out[0] = g_p.dummy == dummy_t::recording ? u16{0} : p1;
+			g_p.override_p2 = false;
+
+			if (g_p.dummy == dummy_t::recording)
+			{
+				g_p.out[1] = p1;
+				g_p.override_p2 = true;
+
+				if (g_p.rec.size() < max_record)
+				{
+					g_p.rec.push_back(p1);
+				}
+				else
+				{
+					g_p.dummy = dummy_t::idle;
+					show("Recording full (20 seconds)");
+				}
+			}
+			else if (g_p.dummy == dummy_t::playing)
+			{
+				if (g_p.play_pos >= g_p.rec.size())
+				{
+					g_p.play_pos = 0;
+
+					if (!g_p.loop)
+					{
+						g_p.dummy = dummy_t::idle;
+					}
+				}
+
+				if (g_p.dummy == dummy_t::playing)
+				{
+					g_p.out[1] = g_p.rec[g_p.play_pos++];
+					g_p.override_p2 = true;
+				}
+			}
+
+			note_press(0, prev_out[0], g_p.out[0]);
+
+			if (g_p.override_p2)
+			{
+				note_press(1, prev_out[1], g_p.out[1]);
+			}
+		}
+
+		u16 on_keys(u32 player, u16 keys)
+		{
+			step();
+
+			if (player == 0)
+			{
+				return g_p.out[0];
+			}
+
+			if (g_p.override_p2)
+			{
+				return g_p.out[1];
+			}
+
+			// The real player 2 (another controller or the CPU's own input): its presses count for the frame data too
+			note_press(1, g_p.out[1], keys);
+			g_p.out[1] = keys;
+			return keys;
+		}
+
+		void frame_data()
+		{
+			// Only while a round runs: its frame counter (rb_t5dr.h) advances; menus and loading leave old values there
+			static u32 last_round_frame = 0;
+			const u32 round_frame = vm::check_addr<4>(t5dr::fight_round_frame) ? +vm::read32(t5dr::fight_round_frame) : 0;
+			const bool active = round_frame != last_round_frame;
+			last_round_frame = round_frame;
+
+			if (!active)
+			{
+				g_p.health[0] = g_p.health[1] = 0;
+				return;
+			}
+
+			for (int victim = 0; victim < 2; victim++)
+			{
+				const u16 hp = static_cast<u16>(t5dr::fight_health_of(victim));
+				const u16 before = g_p.health[victim];
+				g_p.health[victim] = hp;
+
+				if (!before || hp >= before || before - hp > 145)
+				{
+					continue;
+				}
+
+				const int attacker = victim ^ 1;
+				const u32 damage = static_cast<u32>(before - hp);
+
+				if (g_p.frame - g_p.combo_last[victim] > 90)
+				{
+					g_p.combo_hits[victim] = 0;
+					g_p.combo_damage[victim] = 0;
+				}
+
+				g_p.combo_last[victim] = g_p.frame;
+				g_p.combo_hits[victim]++;
+				g_p.combo_damage[victim] += damage;
+
+				if (!g_p.show_frames)
+				{
+					continue;
+				}
+
+				std::string text = fmt::format("P%d hit: %u damage", attacker + 1, damage);
+
+				if (g_p.press[attacker] != umax && g_p.frame - g_p.press[attacker] <= 120)
+				{
+					fmt::append(text, ", startup i%u", g_p.frame - g_p.press[attacker]);
+				}
+
+				if (g_p.combo_hits[victim] > 1)
+				{
+					fmt::append(text, "   combo %u hits, %u damage", g_p.combo_hits[victim], g_p.combo_damage[victim]);
+				}
+
+				show(text, 4);
+			}
+		}
+
+		// Main loop frame boundary, before the task walk
+		void boundary()
+		{
+			g_p.frame++;
+			frame_data();
+
+			if (g_p.capture_left)
+			{
+				g_p.capture_left--;
+				dump_memory_now("practice", g_p.frame);
+				rb_log.notice("Practice capture frame %u: keys %04x %04x, health %u %u, last press %d %d", g_p.frame, g_p.out[0], g_p.out[1],
+					t5dr::fight_health_of(0), t5dr::fight_health_of(1), g_p.press[0] == umax ? -1 : static_cast<int>(g_p.frame - g_p.press[0]),
+					g_p.press[1] == umax ? -1 : static_cast<int>(g_p.frame - g_p.press[1]));
+
+				if (!g_p.capture_left)
+				{
+					show("Capture done: send the practice_*.bin files and RPCS3.log");
+				}
+			}
+
+			if (g_p.req_save)
+			{
+				if (!state_net_ready())
+				{
+					if (g_sync_frame == umax)
+					{
+						force_sync_point("practice");
+					}
+
+					if (!g_p.waiting_sync)
+					{
+						g_p.waiting_sync = true;
+						show("Getting position saving ready, a few seconds...");
+					}
+
+					return; // retried every frame until the first snapshot exists
+				}
+
+				g_p.req_save = false;
+				g_p.waiting_sync = false;
+				state_net_save(g_state.seq[0], g_state.seq);
+				g_p.have_pos = true;
+				g_p.pos_frame = g_state.seq[0];
+				show("Position saved. SELECT + Cross resets to it");
+			}
+
+			if (g_p.req_load)
+			{
+				g_p.req_load = false;
+				snapshot_info info{};
+
+				if (state_net_load(g_p.pos_frame, info))
+				{
+					set_seq(info.seq);
+					g_p.health[0] = g_p.health[1] = 0;
+					g_p.press[0] = g_p.press[1] = umax;
+
+					if (!g_p.rec.empty() && g_p.dummy != dummy_t::recording)
+					{
+						g_p.dummy = dummy_t::playing;
+						g_p.play_pos = 0;
+					}
+				}
+				else
+				{
+					g_p.have_pos = false;
+					show("The saved position is gone (the game reloaded something): save a new one");
+				}
+			}
+		}
+	}
+
 	// Tekken 5 DR (NPEA00019): only the frame hook. The rollback then runs through the netplay path (RB_NET=1,
 	// GGPO over direct UDP, both players' pads on ports 0 and 1 of an offline versus match); the Tekken 6 online
 	// module (rb_online) and the Tekken 6 specific render hooks are not used.
@@ -2941,6 +3310,11 @@ namespace rb
 			{
 				keys = static_cast<u16>(((pad.button[CELL_PAD_BTN_OFFSET_DIGITAL1] & 0xff) << 8) | (pad.button[CELL_PAD_BTN_OFFSET_DIGITAL2] & 0xff));
 			}
+		}
+
+		if (t5p::enabled() && player < 2)
+		{
+			keys = t5p::on_keys(player, keys);
 		}
 
 		return keys;
